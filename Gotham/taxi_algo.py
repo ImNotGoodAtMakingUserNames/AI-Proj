@@ -94,6 +94,48 @@ def getEndTime(start_hour, start_minute, start_second, start_day, start_month, s
     except Exception as e:
         raise ValueError(f"Failed to create end_time from components - hour={start_hour}, minute={start_minute}, second={start_second}, day={start_day}, month={start_month}, year={start_year}, duration={duration}: {e}")
 
+def getTimeofDay(start_hour):
+    if start_hour < 8:
+        return 0 # Early morning
+    if start_hour >= 8 and start_hour < 11:
+        return 1 # Morning
+    if start_hour >= 11 and start_hour < 13:
+        return 2 # Lunch
+    if start_hour >= 1 and start_hour < 16:
+        return 3 # Afternoon
+    if start_hour >= 4 and start_hour < 18:
+        return 4 # Evening
+    if start_hour >= 18 and start_hour < 24:
+        return 5 # Night
+
+
+def isHoliday(start_month, start_day, start_year):
+    """Check if the date is a US federal holiday"""
+    if any(pd.isna(x) for x in [start_month, start_day, start_year]):
+        raise ValueError(f"One or more date components are NaN: month={start_month}, day={start_day}, year={start_year}")
+    
+    month = int(start_month)
+    day = int(start_day)
+    year = int(start_year)
+    
+    holidays_2034 = {
+        (1, 1),    # New Year's Day
+        (1, 16),   # MLK Jr Birthday
+        (2, 20),   # Presidents Day
+        (5, 29),   # Memorial Day
+        (6, 19),   # Juneteenth
+        (7, 4),    # Independence Day
+        (9, 4),    # Labor Day
+        (10, 9),   # Columbus Day
+        (11, 11),  # Veterans Day
+        (11, 23),  # Thanksgiving Day
+        (12, 25),  # Christmas Day
+    }
+    
+    if year != 2034:
+        raise ValueError(f"Holiday checking is only configured for year 2034, got {year}")
+    
+    return (month, day) in holidays_2034
 
 # Read Data
 df = pd.read_csv('Train.csv')
@@ -123,8 +165,14 @@ taxi['season'] = taxi['start_month'].apply(getSeason)
 taxi['end_time'] = taxi.apply(lambda row: getEndTime(row['start_hour'], row['start_minute'], row['start_second'], row['start_day'], row['start_month'], row['start_year'], row['duration']), axis=1)
 # print(taxi['end_time'])
 
+taxi['timeOfDay'] = taxi.apply(lambda row: getTimeofDay(row['start_hour']), axis=1)
+# print(taxi['timeOfDay'])
+
 taxi['is_weekend'] = taxi['dayOfWeek'].apply(isWeekend)
 # print(taxi['is_weekend'])
 
 taxi['additionalStop'] = taxi['NumberOfPassengers'] > 1
 # print(taxi['additionalStop'])
+
+taxi['is_holiday'] = taxi.apply(lambda row: isHoliday(row['start_month'], row['start_day'], row['start_year']), axis=1)
+print(taxi['is_holiday'])
