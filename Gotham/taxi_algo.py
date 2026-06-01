@@ -2,7 +2,15 @@
 from enum import IntEnum
 from dataclasses import dataclass
 import pandas as pd
+import numpy as np
+import statsmodels.api as sm
 from datetime import date, datetime, timedelta
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.model_selection import KFold, cross_val_score, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+from ISLP.models import (ModelSpec as MS, summarize)
 
 
 # 2034-01-30 10:24:44,1,161.6215557,378.3926802,154.5766309,357.1002292
@@ -80,7 +88,7 @@ def isWeekend(day_of_week):
     if day_of_week is None:
         raise ValueError(f"day_of_week is None")
     # weekday() returns 5 for Saturday, 6 for Sunday
-    return day_of_week >= 5
+    return int(day_of_week >= 5)
 
 def getEndTime(start_hour, start_minute, start_second, start_day, start_month, start_year, duration):
     """Calculate end_time by adding duration (in seconds) to pickup_datetime"""
@@ -94,6 +102,24 @@ def getEndTime(start_hour, start_minute, start_second, start_day, start_month, s
     except Exception as e:
         raise ValueError(f"Failed to create end_time from components - hour={start_hour}, minute={start_minute}, second={start_second}, day={start_day}, month={start_month}, year={start_year}, duration={duration}: {e}")
 
+def getEndHour(end_time):
+    """Extract hour from end_time"""
+    if pd.isna(end_time):
+        raise ValueError("end_time is NaN")
+    return int(end_time.hour)
+
+def getEndMinute(end_time):
+    """Extract minute from end_time"""
+    if pd.isna(end_time):
+        raise ValueError("end_time is NaN")
+    return int(end_time.minute)
+
+def getEndSecond(end_time):
+    """Extract second from end_time"""
+    if pd.isna(end_time):
+        raise ValueError("end_time is NaN")
+    return int(end_time.second)
+
 def getTimeofDay(start_hour):
     if start_hour < 8:
         return 0 # Early morning
@@ -101,9 +127,9 @@ def getTimeofDay(start_hour):
         return 1 # Morning
     if start_hour >= 11 and start_hour < 13:
         return 2 # Lunch
-    if start_hour >= 1 and start_hour < 16:
+    if start_hour >= 13 and start_hour < 16:
         return 3 # Afternoon
-    if start_hour >= 4 and start_hour < 18:
+    if start_hour >= 16 and start_hour < 18:
         return 4 # Evening
     if start_hour >= 18 and start_hour < 24:
         return 5 # Night
@@ -135,11 +161,54 @@ def isHoliday(start_month, start_day, start_year):
     if year != 2034:
         raise ValueError(f"Holiday checking is only configured for year 2034, got {year}")
     
-    return (month, day) in holidays_2034
+    return int((month, day) in holidays_2034)
+
+def evaluate_model_kfold(X, y, k=5):
+    """
+    Perform k-fold cross validation on a linear regression model.
+    
+    Parameters:
+    -----------
+    X : DataFrame
+        Feature matrix (without constant)
+    y : Series
+        Target variable
+    k : int, default=5
+        Number of folds for cross-validation
+    
+    Returns:
+    --------
+    dict : Dictionary containing cross-validation results
+        - 'cv_scores': array of R² scores for each fold
+        - 'mean_cv_score': mean R² score across all folds
+        - 'std_cv_score': standard deviation of R² scores
+        - 'model': fitted LinearRegression model on full data (for reference)
+    """
+    kfold = KFold(n_splits=k, shuffle=True, random_state=42)
+    model = LinearRegression()
+    
+    # Perform cross-validation
+    cv_scores = cross_val_score(model, X, y, cv=kfold, scoring='r2')
+    
+    # Fit model on full data for reference
+    model.fit(X, y)
+    
+    results = {
+        'cv_scores': cv_scores,
+        'mean_cv_score': cv_scores.mean(),
+        'std_cv_score': cv_scores.std(),
+        'model': model
+    }
+    
+    return results
 
 # Read Data
 df = pd.read_csv('Train.csv')
-taxi = df.copy()
+# Sample 30% of data for exploration
+taxi = df.sample(frac=0.3, random_state=42).copy()
+
+print('==============|Training Data Imported|==============')
+print(f'Using 30% of training data ({len(taxi)} rows out of {len(df)} total rows)\n')
 
 # Extract granular datetime components from pickup_datetime
 taxi['start_hour'] = taxi['pickup_datetime'].apply(getStartHour)
@@ -165,14 +234,233 @@ taxi['season'] = taxi['start_month'].apply(getSeason)
 taxi['end_time'] = taxi.apply(lambda row: getEndTime(row['start_hour'], row['start_minute'], row['start_second'], row['start_day'], row['start_month'], row['start_year'], row['duration']), axis=1)
 # print(taxi['end_time'])
 
+taxi['end_hour'] = taxi['end_time'].apply(getEndHour)
+taxi['end_minute'] = taxi['end_time'].apply(getEndMinute)
+taxi['end_second'] = taxi['end_time'].apply(getEndSecond)
+
+
 taxi['timeOfDay'] = taxi.apply(lambda row: getTimeofDay(row['start_hour']), axis=1)
 # print(taxi['timeOfDay'])
 
 taxi['is_weekend'] = taxi['dayOfWeek'].apply(isWeekend)
 # print(taxi['is_weekend'])
 
-taxi['additionalStop'] = taxi['NumberOfPassengers'] > 1
+taxi['additionalStop'] = (taxi['NumberOfPassengers'] > 1).astype(int)
 # print(taxi['additionalStop'])
 
 taxi['is_holiday'] = taxi.apply(lambda row: isHoliday(row['start_month'], row['start_day'], row['start_year']), axis=1)
-print(taxi['is_holiday'])
+# print(taxi['is_holiday'])
+
+# ============== FEATURE ENGINEERING ==============
+print('==============|Beginning Feature Engineering|==============\n')
+
+# 1. Polynomial features for distance (capture non-linear distance decay)
+taxi['x2xDistance_squared'] = taxi['x2xDistance'] ** 2
+taxi['y2yDistance_squared'] = taxi['y2yDistance'] ** 2
+taxi['x2xDistance_cubed'] = taxi['x2xDistance'] ** 3
+taxi['y2yDistance_cubed'] = taxi['y2yDistance'] ** 3
+
+# 2. Interaction terms (taxi behavior varies by context)
+taxi['distance_x_timeOfDay'] = taxi['x2xDistance'] * taxi['timeOfDay']
+taxi['distance_y_timeOfDay'] = taxi['y2yDistance'] * taxi['timeOfDay']
+taxi['distance_x_weekend'] = taxi['x2xDistance'] * taxi['is_weekend']
+taxi['distance_y_weekend'] = taxi['y2yDistance'] * taxi['is_weekend']
+taxi['distance_x_hour'] = taxi['x2xDistance'] * taxi['start_hour']
+taxi['distance_y_hour'] = taxi['y2yDistance'] * taxi['start_hour']
+
+# 3. Cyclic encodings for periodic features (hour and month are cyclic, not linear)
+taxi['hour_sin'] = np.sin(2 * np.pi * taxi['start_hour'] / 24)
+taxi['hour_cos'] = np.cos(2 * np.pi * taxi['start_hour'] / 24)
+taxi['month_sin'] = np.sin(2 * np.pi * taxi['start_month'] / 12)
+taxi['month_cos'] = np.cos(2 * np.pi * taxi['start_month'] / 12)
+taxi['dayOfWeek_sin'] = np.sin(2 * np.pi * taxi['dayOfWeek'] / 7)
+taxi['dayOfWeek_cos'] = np.cos(2 * np.pi * taxi['dayOfWeek'] / 7)
+
+# 4. Manhattan distance (alternative to Euclidean)
+taxi['manhattan_distance'] = taxi['x2xDistance'] + taxi['y2yDistance']
+taxi['manhattan_distance_squared'] = taxi['manhattan_distance'] ** 2
+
+# 5. Total distance metric
+taxi['total_distance'] = np.sqrt(taxi['x2xDistance'] ** 2 + taxi['y2yDistance'] ** 2)
+
+# 6. Distance bins/categories (capture non-linear pricing tiers)
+taxi['distance_category'] = pd.cut(taxi['total_distance'], bins=[0, 1, 2, 5, 10, float('inf')], labels=['very_short', 'short', 'medium', 'long', 'very_long']).cat.codes
+
+# 7. Interaction: distance × destination location (origin-destination patterns)
+taxi['distance_x_dest_x'] = taxi['x2xDistance'] * taxi['dropoff_x']
+taxi['distance_y_dest_y'] = taxi['y2yDistance'] * taxi['dropoff_y']
+
+# 8. Time-based interactions
+taxi['hour_x_is_weekend'] = taxi['start_hour'] * taxi['is_weekend']
+taxi['timeOfDay_x_season'] = taxi['timeOfDay'] * taxi['season']
+
+print('==============|Training Data Filtered/Modified|==============\n')
+# print('==============|Beginning Linear Regression 1|==============\n')
+
+# # Linear Regression - All features
+# features1 = ['start_hour', 'start_minute', 'start_second', 'start_day', 'start_month', 'start_year', 'x2xDistance', 'y2yDistance', 'dayOfWeek',
+#                 'season', 'end_hour', 'end_minute', 'end_second', 'timeOfDay', 'additionalStop', 'is_weekend', 'is_holiday']
+
+# x1 = taxi[features1]
+# x1 = sm.add_constant(x1)
+
+# y1 = taxi['duration']
+
+# model1 = sm.OLS(y1, x1)
+# results1 = model1.fit()
+
+# print(results1.summary())
+
+
+# print('==============|Linear Regression 1 Complete|==============\n')
+# First run had adjusted R squared value of 0.598
+# First run shows the following with p values higher than 0.05: start_second, end_minute, end_second, season, y2yDistance, timeOfDay, month_cos, manhattan_distance
+
+# Removing >0.05 p values:
+print('==============|Beginning Linear Regression 2|==============\n')
+
+# Linear Regression - Reduced features with engineered features
+# Original features: start_hour, start_minute, start_day, start_month, x2xDistance, y2yDistance, dayOfWeek,
+#                    end_hour, timeOfDay, additionalStop, is_weekend, is_holiday
+# NEW: polynomial, interactions, cyclic encodings, manhattan distance, distance category, time interactions
+features2 = [
+    # Original features
+    'start_hour', 'start_minute', 'start_day', 'start_month', 
+    'x2xDistance', 'dayOfWeek', 'end_hour', 
+    'additionalStop', 'is_weekend', 'is_holiday',
+    # Polynomial features
+    'x2xDistance_squared', 'y2yDistance_squared', 
+    'x2xDistance_cubed', 'y2yDistance_cubed',
+    # Interaction terms
+    'distance_x_timeOfDay', 'distance_y_timeOfDay', 
+    'distance_x_weekend', 'distance_y_weekend',
+    'distance_x_hour', 'distance_y_hour',
+    # Cyclic encodings
+    'hour_sin', 'hour_cos', 'month_sin', 
+    'dayOfWeek_sin', 'dayOfWeek_cos',
+    # Distance metrics
+    'manhattan_distance_squared', 'total_distance',
+    'distance_category',
+    # Destination interactions
+    'distance_x_dest_x', 'distance_y_dest_y',
+    # Time interactions
+    'hour_x_is_weekend', 'timeOfDay_x_season'
+]
+
+print(f"Total engineered features: {len(features2)}")
+print(f"Feature categories: 12 original + 4 polynomial + 6 interaction + 6 cyclic + 4 distance + 2 destination + 2 time = {len(features2)} total\n")
+
+x2 = taxi[features2]
+x2 = sm.add_constant(x2)
+
+y2 = taxi['duration']
+
+model2 = sm.OLS(y2, x2)
+results2 = model2.fit()
+
+print(results2.summary())
+
+print('==============|Linear Regression 2 Complete|==============\n')
+
+# K-Fold Cross Validation for Model 2 (Linear - baseline)
+print('==============|K-Fold Cross Validation - Model 2 (Linear)|==============\n')
+x2_no_const = taxi[features2]  # sklearn doesn't need manual constant addition
+
+# Scale features for Ridge/Lasso
+scaler = StandardScaler()
+x2_scaled = scaler.fit_transform(x2_no_const)
+
+y2 = taxi['duration']
+
+# Linear Regression (unscaled for comparison)
+linear_model = LinearRegression()
+linear_cv_scores = cross_val_score(linear_model, x2_scaled, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+
+print(f"Linear Regression CV R² Scores: {linear_cv_scores}")
+print(f"Linear Mean CV R²: {linear_cv_scores.mean():.6f}")
+print(f"Linear Std Dev CV R²: {linear_cv_scores.std():.6f}")
+print('==============|Linear Regression CV Complete|==============\n')
+
+# Ridge Regression with GridSearchCV
+print('==============|Ridge Regression - Model 3|==============\n')
+ridge_alphas = np.logspace(-3, 4, 150)  # Expanded range: 0.001 to 10000
+ridge_model = Ridge()
+
+ridge_pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('ridge', Ridge())
+])
+
+ridge_grid = GridSearchCV(ridge_pipeline, {'ridge__alpha': ridge_alphas}, cv=5, scoring='r2', n_jobs=-1)
+ridge_grid.fit(x2_no_const, y2)
+
+print(f"Best Ridge Alpha: {ridge_grid.best_params_['ridge__alpha']:.6f}")
+print(f"Best Ridge CV R² Score: {ridge_grid.best_score_:.6f}")
+
+# Evaluate best Ridge model with k-fold
+ridge_best = Ridge(alpha=ridge_grid.best_params_['ridge__alpha'])
+ridge_cv_scores = cross_val_score(ridge_best, x2_scaled, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+print(f"Ridge CV R² Scores (5 folds): {ridge_cv_scores}")
+print(f"Ridge Mean CV R²: {ridge_cv_scores.mean():.6f}")
+print(f"Ridge Std Dev CV R²: {ridge_cv_scores.std():.6f}")
+
+# Show top 10 alpha values tested
+top_alphas_ridge = sorted(zip(ridge_grid.cv_results_['param_ridge__alpha'], ridge_grid.cv_results_['mean_test_score']), key=lambda x: x[1], reverse=True)[:10]
+print(f"\nTop 10 Ridge Alpha values tested:")
+for alpha, score in top_alphas_ridge:
+    print(f"  Alpha: {alpha:.6f} -> R²: {score:.6f}")
+print('==============|Ridge Regression Complete|==============\n')
+
+# Lasso Regression with GridSearchCV
+print('==============|Lasso Regression - Model 4|==============\n')
+print('Note: Lasso may show ConvergenceWarning - this is normal with many features. Increasing iterations to handle engineered features...\n')
+lasso_alphas = np.logspace(-4, 1, 150)  # Expanded range: 0.0001 to 10
+lasso_model = Lasso(max_iter=200000, tol=1e-3, warm_start=False)
+
+lasso_pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('lasso', Lasso(max_iter=200000, tol=1e-3, warm_start=False))
+])
+
+lasso_grid = GridSearchCV(lasso_pipeline, {'lasso__alpha': lasso_alphas}, cv=5, scoring='r2', n_jobs=-1)
+lasso_grid.fit(x2_no_const, y2)
+
+print(f"Best Lasso Alpha: {lasso_grid.best_params_['lasso__alpha']:.6f}")
+print(f"Best Lasso CV R² Score: {lasso_grid.best_score_:.6f}")
+
+# Evaluate best Lasso model with k-fold
+lasso_best = Lasso(alpha=lasso_grid.best_params_['lasso__alpha'], max_iter=200000, tol=1e-3, warm_start=False)
+lasso_cv_scores = cross_val_score(lasso_best, x2_scaled, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+print(f"Lasso CV R² Scores (5 folds): {lasso_cv_scores}")
+print(f"Lasso Mean CV R²: {lasso_cv_scores.mean():.6f}")
+print(f"Lasso Std Dev CV R²: {lasso_cv_scores.std():.6f}")
+
+# Show top 10 alpha values tested
+top_alphas_lasso = sorted(zip(lasso_grid.cv_results_['param_lasso__alpha'], lasso_grid.cv_results_['mean_test_score']), key=lambda x: x[1], reverse=True)[:10]
+print(f"\nTop 10 Lasso Alpha values tested:")
+for alpha, score in top_alphas_lasso:
+    print(f"  Alpha: {alpha:.6f} -> R²: {score:.6f}")
+print('==============|Lasso Regression Complete|==============\n')
+
+
+# Model Comparison Summary
+print('==============|Model Comparison Summary|==============')
+print(f"Linear Regression (Model 2)     - Mean CV R²: {linear_cv_scores.mean():.6f} ± {linear_cv_scores.std():.6f}")
+print(f"Ridge Regression (Model 3)      - Mean CV R²: {ridge_cv_scores.mean():.6f} ± {ridge_cv_scores.std():.6f}")
+print(f"Lasso Regression (Model 4)      - Mean CV R²: {lasso_cv_scores.mean():.6f} ± {lasso_cv_scores.std():.6f}")
+print('==============|Comparison Complete|==============\n')
+
+# Feature Importance Analysis
+print('==============|Feature Importance Analysis|==============\n')
+print(f"Top 15 Most Important Features (by absolute coefficient magnitude):\n")
+
+# Get the OLS model coefficients (excluding constant)
+coef_importance = pd.DataFrame({
+    'feature': features2,
+    'coefficient': results2.params[1:].values  # Skip constant term
+}).sort_values('coefficient', key=abs, ascending=False)
+
+for idx, (_, row) in enumerate(coef_importance.head(15).iterrows(), 1):
+    print(f"{idx:2d}. {row['feature']:25s} -> Coef: {row['coefficient']:12.6f}")
+
+print('\n==============|Feature Importance Complete|==============\n')
