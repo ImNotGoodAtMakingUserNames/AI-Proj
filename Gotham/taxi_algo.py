@@ -6,9 +6,12 @@ import numpy as np
 import statsmodels.api as sm
 from datetime import date, datetime, timedelta
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
-from sklearn.model_selection import KFold, cross_val_score, GridSearchCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold, cross_val_score, GridSearchCV, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.inspection import permutation_importance
+from sklearn.ensemble import GradientBoostingRegressor
 
 from ISLP.models import (ModelSpec as MS, summarize)
 
@@ -315,6 +318,7 @@ print('==============|Training Data Filtered/Modified|==============\n')
 # print('==============|Linear Regression 1 Complete|==============\n')
 # First run had adjusted R squared value of 0.598
 # First run shows the following with p values higher than 0.05: start_second, end_minute, end_second, season, y2yDistance, timeOfDay, month_cos, manhattan_distance
+# Removed after Forest analysis: 'is_holiday',
 
 # Removing >0.05 p values:
 print('==============|Beginning Linear Regression 2|==============\n')
@@ -327,7 +331,7 @@ features2 = [
     # Original features
     'start_hour', 'start_minute', 'start_day', 'start_month', 
     'x2xDistance', 'dayOfWeek', 'end_hour', 
-    'additionalStop', 'is_weekend', 'is_holiday',
+    'additionalStop', 'is_weekend', 
     # Polynomial features
     'x2xDistance_squared', 'y2yDistance_squared', 
     'x2xDistance_cubed', 'y2yDistance_cubed',
@@ -391,7 +395,7 @@ ridge_pipeline = Pipeline([
     ('ridge', Ridge())
 ])
 
-ridge_grid = GridSearchCV(ridge_pipeline, {'ridge__alpha': ridge_alphas}, cv=5, scoring='r2', n_jobs=-1)
+ridge_grid = GridSearchCV(ridge_pipeline, {'ridge__alpha': ridge_alphas}, cv=5, scoring='r2', n_jobs=12)
 ridge_grid.fit(x2_no_const, y2)
 
 print(f"Best Ridge Alpha: {ridge_grid.best_params_['ridge__alpha']:.6f}")
@@ -411,43 +415,157 @@ for alpha, score in top_alphas_ridge:
     print(f"  Alpha: {alpha:.6f} -> R²: {score:.6f}")
 print('==============|Ridge Regression Complete|==============\n')
 
-# Lasso Regression with GridSearchCV
-print('==============|Lasso Regression - Model 4|==============\n')
-print('Note: Lasso may show ConvergenceWarning - this is normal with many features. Increasing iterations to handle engineered features...\n')
-lasso_alphas = np.logspace(-4, 1, 150)  # Expanded range: 0.0001 to 10
-lasso_model = Lasso(max_iter=200000, tol=1e-3, warm_start=False)
+# # Lasso Regression with GridSearchCV
+# print('==============|Lasso Regression - Model 4|==============\n')
+# print('Note: Lasso may show ConvergenceWarning - this is normal with many features. Increasing iterations to handle engineered features...\n')
+# lasso_alphas = np.logspace(-4, 1, 150)  # Expanded range: 0.0001 to 10
+# lasso_model = Lasso(max_iter=200000, tol=1e-3, warm_start=False)
 
-lasso_pipeline = Pipeline([
-    ('scaler', StandardScaler()),
-    ('lasso', Lasso(max_iter=200000, tol=1e-3, warm_start=False))
-])
+# lasso_pipeline = Pipeline([
+#     ('scaler', StandardScaler()),
+#     ('lasso', Lasso(max_iter=200000, tol=1e-3, warm_start=False))
+# ])
 
-lasso_grid = GridSearchCV(lasso_pipeline, {'lasso__alpha': lasso_alphas}, cv=5, scoring='r2', n_jobs=-1)
-lasso_grid.fit(x2_no_const, y2)
+# lasso_grid = GridSearchCV(lasso_pipeline, {'lasso__alpha': lasso_alphas}, cv=5, scoring='r2', n_jobs=12)
+# lasso_grid.fit(x2_no_const, y2)
 
-print(f"Best Lasso Alpha: {lasso_grid.best_params_['lasso__alpha']:.6f}")
-print(f"Best Lasso CV R² Score: {lasso_grid.best_score_:.6f}")
+# print(f"Best Lasso Alpha: {lasso_grid.best_params_['lasso__alpha']:.6f}")
+# print(f"Best Lasso CV R² Score: {lasso_grid.best_score_:.6f}")
 
-# Evaluate best Lasso model with k-fold
-lasso_best = Lasso(alpha=lasso_grid.best_params_['lasso__alpha'], max_iter=200000, tol=1e-3, warm_start=False)
-lasso_cv_scores = cross_val_score(lasso_best, x2_scaled, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-print(f"Lasso CV R² Scores (5 folds): {lasso_cv_scores}")
-print(f"Lasso Mean CV R²: {lasso_cv_scores.mean():.6f}")
-print(f"Lasso Std Dev CV R²: {lasso_cv_scores.std():.6f}")
+# # Evaluate best Lasso model with k-fold
+# lasso_best = Lasso(alpha=lasso_grid.best_params_['lasso__alpha'], max_iter=200000, tol=1e-3, warm_start=False)
+# lasso_cv_scores = cross_val_score(lasso_best, x2_scaled, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+# print(f"Lasso CV R² Scores (5 folds): {lasso_cv_scores}")
+# print(f"Lasso Mean CV R²: {lasso_cv_scores.mean():.6f}")
+# print(f"Lasso Std Dev CV R²: {lasso_cv_scores.std():.6f}")
 
-# Show top 10 alpha values tested
-top_alphas_lasso = sorted(zip(lasso_grid.cv_results_['param_lasso__alpha'], lasso_grid.cv_results_['mean_test_score']), key=lambda x: x[1], reverse=True)[:10]
-print(f"\nTop 10 Lasso Alpha values tested:")
-for alpha, score in top_alphas_lasso:
-    print(f"  Alpha: {alpha:.6f} -> R²: {score:.6f}")
-print('==============|Lasso Regression Complete|==============\n')
+# # Show top 10 alpha values tested
+# top_alphas_lasso = sorted(zip(lasso_grid.cv_results_['param_lasso__alpha'], lasso_grid.cv_results_['mean_test_score']), key=lambda x: x[1], reverse=True)[:10]
+# print(f"\nTop 10 Lasso Alpha values tested:")
+# for alpha, score in top_alphas_lasso:
+#     print(f"  Alpha: {alpha:.6f} -> R²: {score:.6f}")
+# print('==============|Lasso Regression Complete|==============\n')
 
 
 # Model Comparison Summary
 print('==============|Model Comparison Summary|==============')
 print(f"Linear Regression (Model 2)     - Mean CV R²: {linear_cv_scores.mean():.6f} ± {linear_cv_scores.std():.6f}")
 print(f"Ridge Regression (Model 3)      - Mean CV R²: {ridge_cv_scores.mean():.6f} ± {ridge_cv_scores.std():.6f}")
-print(f"Lasso Regression (Model 4)      - Mean CV R²: {lasso_cv_scores.mean():.6f} ± {lasso_cv_scores.std():.6f}")
+# print(f"Lasso Regression (Model 4)      - Mean CV R²: {lasso_cv_scores.mean():.6f} ± {lasso_cv_scores.std():.6f}")
+print('==============|Comparison Complete|==============\n')
+
+# Random Forest Regression with minimal parameter search (FAST)
+print('==============|Random Forest Regression - Model 5|==============\n')
+
+# Minimal params for speed on 300K rows: only 12 combinations with 3-fold CV
+rf_param_grid = {
+    'n_estimators': [100, 200],
+    'max_depth': [15, 20],
+    'min_samples_split': [5, 10],
+    'min_samples_leaf': [2, 4],
+    'max_features': ['sqrt', 'log2']
+}
+
+rf_model = RandomForestRegressor(random_state=42, n_jobs=12)
+rf_grid = GridSearchCV(rf_model, rf_param_grid, cv=3, scoring='r2', n_jobs=12, verbose=1)
+
+print("Training Random Forest with GridSearchCV (12 combinations, 3-fold CV)...\n")
+rf_grid.fit(x2_no_const, y2)
+
+print(f"\nBest Random Forest Hyperparameters:")
+for param, value in rf_grid.best_params_.items():
+    print(f"  {param}: {value}")
+print(f"\nBest Random Forest CV R² Score: {rf_grid.best_score_:.6f}")
+
+# Evaluate best Random Forest model with k-fold (5-fold for final evaluation)
+rf_best = RandomForestRegressor(
+    n_estimators=rf_grid.best_params_['n_estimators'],
+    max_depth=rf_grid.best_params_['max_depth'],
+    min_samples_split=rf_grid.best_params_['min_samples_split'],
+    min_samples_leaf=rf_grid.best_params_['min_samples_leaf'],
+    max_features=rf_grid.best_params_['max_features'],
+    random_state=42,
+    n_jobs=12
+)
+
+rf_cv_scores = cross_val_score(rf_best, x2_no_const, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
+print(f"\nRandom Forest CV R² Scores (5 folds): {rf_cv_scores}")
+print(f"Random Forest Mean CV R²: {rf_cv_scores.mean():.6f}")
+print(f"Random Forest Std Dev CV R²: {rf_cv_scores.std():.6f}")
+
+# Show top 10 hyperparameter combinations tested
+top_rf_combos = sorted(zip(rf_grid.cv_results_['params'], rf_grid.cv_results_['mean_test_score']), key=lambda x: x[1], reverse=True)[:10]
+print(f"\nTop Random Forest hyperparameter combinations:")
+for idx, (params, score) in enumerate(top_rf_combos, 1):
+    print(f"  {idx}. n_est={params['n_estimators']}, depth={params['max_depth']}, split={params['min_samples_split']}, leaf={params['min_samples_leaf']}, max_feat={params['max_features']} -> R²: {score:.6f}")
+
+print('==============|Random Forest Regression Complete|==============\n')
+
+# Gradient Boosting Regression (FAST VERSION)
+print('==============|Gradient Boosting Regression - Model 6|==============\n')
+
+# Minimal params for speed: only 16 combinations with 3-fold CV
+gb_param_grid = {
+    'n_estimators': [100, 150],
+    'learning_rate': [0.05, 0.1],
+    'max_depth': [3, 5],
+    'subsample': [0.8, 1.0],
+    'colsample_bytree': [0.8, 1.0]
+}
+
+gb_model = GradientBoostingRegressor(random_state=42)
+gb_grid = GridSearchCV(gb_model, gb_param_grid, cv=3, scoring='r2', n_jobs=12, verbose=1)
+
+print("Training Gradient Boosting with GridSearchCV (16 combinations, 3-fold CV)...\n")
+gb_grid.fit(x2_no_const, y2)
+
+print(f"\nBest Gradient Boosting Hyperparameters:")
+for param, value in gb_grid.best_params_.items():
+    print(f"  {param}: {value}")
+print(f"\nBest Gradient Boosting CV R² Score: {gb_grid.best_score_:.6f}")
+
+# Evaluate best GB model with k-fold (5-fold for final evaluation)
+gb_best = GradientBoostingRegressor(
+    n_estimators=gb_grid.best_params_['n_estimators'],
+    learning_rate=gb_grid.best_params_['learning_rate'],
+    max_depth=gb_grid.best_params_['max_depth'],
+    subsample=gb_grid.best_params_['subsample'],
+    colsample_bytree=gb_grid.best_params_['colsample_bytree'],
+    random_state=42
+)
+
+gb_cv_scores = cross_val_score(gb_best, x2_no_const, y2, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+print(f"\nGradient Boosting CV R² Scores (5 folds): {gb_cv_scores}")
+print(f"Gradient Boosting Mean CV R²: {gb_cv_scores.mean():.6f}")
+print(f"Gradient Boosting Std Dev CV R²: {gb_cv_scores.std():.6f}")
+
+# Show top hyperparameter combinations tested
+top_gb_combos = sorted(zip(gb_grid.cv_results_['params'], gb_grid.cv_results_['mean_test_score']), key=lambda x: x[1], reverse=True)[:5]
+print(f"\nTop Gradient Boosting hyperparameter combinations:")
+for idx, (params, score) in enumerate(top_gb_combos, 1):
+    print(f"  {idx}. n_est={params['n_estimators']}, lr={params['learning_rate']}, depth={params['max_depth']}, subsample={params['subsample']} -> R²: {score:.6f}")
+
+print('==============|Gradient Boosting Regression Complete|==============\n')
+
+
+# Updated Model Comparison Summary
+print('==============|Final Model Comparison Summary|==============')
+print(f"Linear Regression (Model 2)     - Mean CV R²: {linear_cv_scores.mean():.6f} ± {linear_cv_scores.std():.6f}")
+print(f"Ridge Regression (Model 3)      - Mean CV R²: {ridge_cv_scores.mean():.6f} ± {ridge_cv_scores.std():.6f}")
+# print(f"Lasso Regression (Model 4)      - Mean CV R²: {lasso_cv_scores.mean():.6f} ± {lasso_cv_scores.std():.6f}")
+print(f"Random Forest (Model 5)         - Mean CV R²: {rf_cv_scores.mean():.6f} ± {rf_cv_scores.std():.6f}")
+print(f"Gradient Boosting (Model 6)     - Mean CV R²: {gb_cv_scores.mean():.6f} ± {gb_cv_scores.std():.6f}")
+
+# Determine best model
+models_comparison = [
+    ('Linear', linear_cv_scores.mean()),
+    ('Ridge', ridge_cv_scores.mean()),
+    # ('Lasso', lasso_cv_scores.mean()),
+    ('Random Forest', rf_cv_scores.mean()),
+    ('Gradient Boosting', gb_cv_scores.mean())
+]
+best_model = max(models_comparison, key=lambda x: x[1])
+print(f"\n🏆 Best Model: {best_model[0]} with R² = {best_model[1]:.6f}")
 print('==============|Comparison Complete|==============\n')
 
 # Feature Importance Analysis
@@ -464,3 +582,86 @@ for idx, (_, row) in enumerate(coef_importance.head(15).iterrows(), 1):
     print(f"{idx:2d}. {row['feature']:25s} -> Coef: {row['coefficient']:12.6f}")
 
 print('\n==============|Feature Importance Complete|==============\n')
+
+# Random Forest Feature Importance
+print('==============|Random Forest Feature Importance Analysis|==============\n')
+print(f"Top 15 Most Important Features (by Random Forest importance):\n")
+
+# Train final RF model on all data to get feature importances
+rf_final = RandomForestRegressor(
+    n_estimators=rf_grid.best_params_['n_estimators'],
+    max_depth=rf_grid.best_params_['max_depth'],
+    min_samples_split=rf_grid.best_params_['min_samples_split'],
+    min_samples_leaf=rf_grid.best_params_['min_samples_leaf'],
+    max_features=rf_grid.best_params_['max_features'],
+    max_samples=rf_grid.best_params_['max_samples'],
+    min_weight_fraction_leaf=rf_grid.best_params_['min_weight_fraction_leaf'],
+    random_state=42,
+    n_jobs=12
+)
+rf_final.fit(x2_no_const, y2)
+
+rf_importance = pd.DataFrame({
+    'feature': features2,
+    'importance': rf_final.feature_importances_
+}).sort_values('importance', ascending=False)
+
+for idx, (_, row) in enumerate(rf_importance.head(15).iterrows(), 1):
+    print(f"{idx:2d}. {row['feature']:25s} -> Importance: {row['importance']:12.6f}")
+
+print('\n==============|Random Forest Feature Importance Complete|==============\n')
+
+# Permutation Importance Analysis
+print('==============|Permutation Importance Analysis|==============\n')
+print("Computing permutation importance (measures R² drop when feature is shuffled)...\n")
+
+perm_importance = permutation_importance(rf_final, x2_no_const, y2, n_repeats=10, random_state=42, n_jobs=12, scoring='r2')
+
+perm_importance_df = pd.DataFrame({
+    'feature': features2,
+    'importance_mean': perm_importance.importances_mean,
+    'importance_std': perm_importance.importances_std
+}).sort_values('importance_mean', ascending=False)
+
+print(f"Top 15 Most Important Features (by Permutation Importance):\n")
+print("Note: Positive values = R² decrease when feature is shuffled (more important)")
+print("      Negative values = minimal/no impact (feature may be redundant)\n")
+
+for idx, (_, row) in enumerate(perm_importance_df.head(15).iterrows(), 1):
+    print(f"{idx:2d}. {row['feature']:25s} -> Mean: {row['importance_mean']:10.6f} ± {row['importance_std']:10.6f}")
+
+print('\n' + '='*70)
+print("Features with NEGATIVE or near-zero permutation importance are candidates")
+print("for removal, as they don't meaningfully impact model performance.")
+print('='*70 + '\n')
+
+# Show features with minimal importance (potential candidates for removal)
+minimal_importance = perm_importance_df[perm_importance_df['importance_mean'] < 0.001]
+if len(minimal_importance) > 0:
+    print(f"⚠️  Candidate Features for Removal (importance < 0.001):\n")
+    for idx, (_, row) in enumerate(minimal_importance.iterrows(), 1):
+        print(f"  {idx}. {row['feature']:25s} -> {row['importance_mean']:10.6f}")
+else:
+    print("✓ No features with near-zero permutation importance found.\n")
+
+print('==============|Permutation Importance Complete|==============\n')
+
+# Gradient Boosting Regression
+print('==============|Gradient Boosting Regression - Model 6|==============\n')
+
+gb_param_grid = {
+    'n_estimators': [100, 200, 300],
+    'learning_rate': [0.01, 0.05, 0.1],     # Lower = more robust
+    'max_depth': [3, 5, 7, 9],              # Shallow trees for boosting
+    'subsample': [0.8, 0.9, 1.0],          # Row sampling
+    'colsample_bytree': [0.8, 1.0],        # Column sampling
+    'min_samples_split': [2, 5]
+}
+
+gb_model = GradientBoostingRegressor(random_state=42, validation_fraction=0.1, n_iter_no_change=10)
+gb_grid = RandomizedSearchCV(gb_model, gb_param_grid, n_iter=50, cv=5, scoring='r2', n_jobs=12, random_state=42)
+gb_grid.fit(x2_no_const, y2)
+
+gb_best = GradientBoostingRegressor(**gb_grid.best_params_, random_state=42)
+gb_cv_scores = cross_val_score(gb_best, x2_no_const, y2, cv=5, scoring='r2')
+print(f"Gradient Boosting Mean CV R²: {gb_cv_scores.mean():.6f} ± {gb_cv_scores.std():.6f}")
