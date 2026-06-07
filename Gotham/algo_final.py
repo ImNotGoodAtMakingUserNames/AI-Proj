@@ -41,16 +41,16 @@ ENABLE_NEURAL_NETWORK = False
 
     # Tree-based models
 ENABLE_RANDOM_FOREST = False
-ENABLE_DECISION_TREE = True
-ENABLE_GRADIENT_BOOSTING = True
-ENABLE_ADABOOST = True
-ENABLE_XGBOOST = True
-ENABLE_CATBOOST = True
-ENABLE_LIGHTGBM = True
+ENABLE_DECISION_TREE = False
+ENABLE_GRADIENT_BOOSTING = False
+ENABLE_ADABOOST = False
+ENABLE_XGBOOST = False
+ENABLE_CATBOOST = False
+ENABLE_LIGHTGBM = False
 # ============================================
 
 def parseDateTime(dateString):
-    """Parse datetime string and return datetime object, raise exception on error"""
+    """Parse datetime string and return datetime object"""
     if pd.isna(dateString):
         raise ValueError(f"dateString is NaN")
     try:
@@ -297,6 +297,7 @@ if ENABLE_RIDGE_REGRESSION:
         ('ridge', Ridge())
     ])
 
+    # GridSearchCV for optomization
     ridge_grid = GridSearchCV(ridge_pipeline, {'ridge__alpha': ridge_alphas}, cv=5, scoring='r2', n_jobs=12)
     ridge_grid.fit(x, y)
 
@@ -313,8 +314,7 @@ if ENABLE_RIDGE_REGRESSION:
 if ENABLE_LASSO_REGRESSION:
     print('==============|Lasso Regression|==============')
     
-    # Use LassoCV for efficient alpha selection (built-in cross-validation)
-    # This is much faster than GridSearchCV with many alphas
+    # LassoCV for optomization 
     lasso_cv = LassoCV(
         alphas=np.logspace(-4, 2, 50),  # 50 alpha values (fast!)
         cv=5,
@@ -432,7 +432,7 @@ if ENABLE_NEURAL_NETWORK:
         dropout_rate = trial.suggest_float('dropout_rate', 0.0, 0.3)
         batch_size = trial.suggest_int('batch_size', 16, 64)
         
-        # Evaluate with 3-fold CV (faster)
+        # Evaluate with 3-fold CV to save on time
         cv_scores = []
         kfold = KFold(n_splits=3, shuffle=True, random_state=42)
         
@@ -480,14 +480,13 @@ if ENABLE_RANDOM_FOREST:
             n_jobs=12
         )
         
-        # 3-fold CV for speed
-        cv_scores = cross_val_score(rf_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(rf_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2', n_jobs=12)
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(rf_objective, n_trials=20, show_progress_bar=True)
+    study.optimize(rf_objective, n_trials=10, show_progress_bar=True)
     
     best_rf_trial = study.best_trial
     
@@ -529,13 +528,13 @@ if ENABLE_DECISION_TREE:
             random_state=42
         )
         
-        cv_scores = cross_val_score(dt_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(dt_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2')
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(dt_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(dt_objective, n_trials=10, show_progress_bar=True)
     
     best_dt_trial = study.best_trial
     
@@ -578,13 +577,13 @@ if ENABLE_GRADIENT_BOOSTING:
             random_state=42
         )
         
-        cv_scores = cross_val_score(gb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(gb_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2')
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(gb_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(gb_objective, n_trials=10, show_progress_bar=True)
     
     best_gb_trial = study.best_trial
     
@@ -623,13 +622,13 @@ if ENABLE_ADABOOST:
             random_state=42
         )
         
-        cv_scores = cross_val_score(ab_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(ab_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2')
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(ab_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(ab_objective, n_trials=10, show_progress_bar=True)
     
     best_ab_trial = study.best_trial
     
@@ -673,13 +672,13 @@ if ENABLE_XGBOOST:
             verbosity=0
         )
         
-        cv_scores = cross_val_score(xgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(xgb_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2', n_jobs=12)
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(xgb_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(xgb_objective, n_trials=10, show_progress_bar=True)
     
     best_xgb_trial = study.best_trial
     
@@ -723,13 +722,13 @@ if ENABLE_CATBOOST:
             verbose=False
         )
         
-        cv_scores = cross_val_score(cb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(cb_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2')
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(cb_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(cb_objective, n_trials=10, show_progress_bar=True)
     
     best_cb_trial = study.best_trial
     
@@ -773,13 +772,13 @@ if ENABLE_LIGHTGBM:
             verbose=-1
         )
         
-        cv_scores = cross_val_score(lgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), 
+        cv_scores = cross_val_score(lgb_model, x, y, cv=KFold(n_splits=3, shuffle=True, random_state=42), 
                                    scoring='r2', n_jobs=12)
         return cv_scores.mean()
     
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(lgb_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(lgb_objective, n_trials=10, show_progress_bar=True)
     
     best_lgb_trial = study.best_trial
     
@@ -805,5 +804,206 @@ if ENABLE_LIGHTGBM:
     print(f"LightGBM Std Dev CV R²: {lgb_cv_scores.std():.6f}\n")
 
 
-# Cross Validation Curves of top 3 R^2 models
+# Store pre-computed best trial values from previous runs
+class BestTrialMock:
+    def __init__(self, params_dict, value=None):
+        self.params = params_dict
+        self.value = value
+
+# Best Trial Values from Previous Runs
+best_rf_trial = BestTrialMock({
+    'n_estimators': 271,
+    'max_depth': 24,
+    'min_samples_split': 7,
+    'min_samples_leaf': 3,
+    'max_features': 'sqrt'
+})
+
+best_dt_trial = BestTrialMock({
+    'max_depth': 9,
+    'min_samples_split': 7,
+    'min_samples_leaf': 5,
+    'splitter': 'best'
+})
+
+best_gb_trial = BestTrialMock({
+    'n_estimators': 144,
+    'learning_rate': 0.07969454818643935,
+    'max_depth': 8,
+    'min_samples_split': 13,
+    'min_samples_leaf': 2,
+    'subsample': 0.662397808134481
+})
+
+best_xgb_trial = BestTrialMock({
+    'n_estimators': 144,
+    'learning_rate': 0.22648248189516848,
+    'max_depth': 8,
+    'min_child_weight': 5,
+    'subsample': 0.6624074561769746,
+    'colsample_bytree': 0.662397808134481
+})
+
+best_cb_trial = BestTrialMock({
+    'iterations': 144,
+    'learning_rate': 0.22648248189516848,
+    'depth': 9,
+    'l2_leaf_reg': 6.387926357773329
+})
+
+best_lgb_trial = BestTrialMock({
+    'n_estimators': 144,
+    'learning_rate': 0.22648248189516848,
+    'num_leaves': 79,
+    'min_child_samples': 32,
+    'subsample': 0.6624074561769746
+})
+
+# Cross Validation Curves of top 4 R^2 models
+print('==============|Cross-Validation Curves: Depth Analysis|==============\n')
+
+import matplotlib.pyplot as plt
+import json
+import os
+from datetime import datetime
+
+# Define depth range
+depths = list(range(1, 15))  # 2 to 17 inclusive
+
+# Checkpoint file for resuming work
+checkpoint_file = 'results_logs/cv_curves_checkpoint.json'
+
+# Load checkpoint if it exists
+checkpoint_data = {}
+if os.path.exists(checkpoint_file):
+    with open(checkpoint_file, 'r') as f:
+        checkpoint_data = json.load(f)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded checkpoint from {checkpoint_file}\n")
+
+# Store CV scores for each model
+xgb_depths_scores = checkpoint_data.get('xgb_depths_scores', [])
+catboost_depths_scores = checkpoint_data.get('catboost_depths_scores', [])
+lightgbm_depths_scores = checkpoint_data.get('lightgbm_depths_scores', [])
+gb_depths_scores = checkpoint_data.get('gb_depths_scores', [])
+
+# XGBoost across depths
+if len(xgb_depths_scores) == 0:
+    print("XGBoost: ")
+    for depth in depths:
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=best_xgb_trial.params['n_estimators'],
+            learning_rate=best_xgb_trial.params['learning_rate'],
+            max_depth=depth,
+            min_child_weight=best_xgb_trial.params['min_child_weight'],
+            subsample=best_xgb_trial.params['subsample'],
+            colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+            random_state=42,
+            n_jobs=12,
+            verbosity=0
+        )
+        cv_scores = cross_val_score(xgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
+        mean_score = cv_scores.mean()
+        xgb_depths_scores.append(mean_score)
+        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+    print(" Done")
+    checkpoint_data['xgb_depths_scores'] = xgb_depths_scores
+else:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded XGBoost results from checkpoint ({len(xgb_depths_scores)} depths)")
+
+# CatBoost across depths
+if len(catboost_depths_scores) == 0:
+    print("CatBoost: ")
+    for depth in depths:
+        cb_model = __import__('catboost', fromlist=['CatBoostRegressor']).CatBoostRegressor(
+            iterations=best_cb_trial.params['iterations'],
+            learning_rate=best_cb_trial.params['learning_rate'],
+            depth=depth,
+            l2_leaf_reg=best_cb_trial.params['l2_leaf_reg'],
+            random_state=42,
+            verbose=False
+        )
+        cv_scores = cross_val_score(cb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+        mean_score = cv_scores.mean()
+        catboost_depths_scores.append(mean_score)
+        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+    print(" Done")
+    checkpoint_data['catboost_depths_scores'] = catboost_depths_scores
+else:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded CatBoost results from checkpoint ({len(catboost_depths_scores)} depths)")
+
+# LightGBM across depths
+if len(lightgbm_depths_scores) == 0:
+    print("LightGBM: ")
+    for depth in depths:
+        lgb_model = lgb.LGBMRegressor(
+            n_estimators=best_lgb_trial.params['n_estimators'],
+            learning_rate=best_lgb_trial.params['learning_rate'],
+            num_leaves=2**depth,  # LightGBM uses num_leaves instead of max_depth
+            min_child_samples=best_lgb_trial.params['min_child_samples'],
+            subsample=best_lgb_trial.params['subsample'],
+            random_state=42,
+            n_jobs=12,
+            verbose=-1
+        )
+        cv_scores = cross_val_score(lgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
+        mean_score = cv_scores.mean()
+        lightgbm_depths_scores.append(mean_score)
+        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+    print(" Done")
+    checkpoint_data['lightgbm_depths_scores'] = lightgbm_depths_scores
+else:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded LightGBM results from checkpoint ({len(lightgbm_depths_scores)} depths)")
+
+# Gradient Boosting across depths (LIMITED TO 3 DEPTHS)
+gb_depths_limited = [1, 2, 3]
+if len(gb_depths_scores) == 0:
+    print("Gradient Boosting (LIMITED to 3 depths): ")
+    for depth in gb_depths_limited:
+        gb_model = GradientBoostingRegressor(
+            n_estimators=best_gb_trial.params['n_estimators'],
+            learning_rate=best_gb_trial.params['learning_rate'],
+            max_depth=depth,
+            min_samples_split=best_gb_trial.params['min_samples_split'],
+            min_samples_leaf=best_gb_trial.params['min_samples_leaf'],
+            subsample=best_gb_trial.params['subsample'],
+            random_state=42
+        )
+        cv_scores = cross_val_score(gb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+        mean_score = cv_scores.mean()
+        gb_depths_scores.append(mean_score)
+        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+    print(" Done")
+    checkpoint_data['gb_depths_scores'] = gb_depths_scores
+else:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded Gradient Boosting results from checkpoint ({len(gb_depths_scores)} depths)")
+
+# Save checkpoint after all models complete
+with open(checkpoint_file, 'w') as f:
+    json.dump(checkpoint_data, f, indent=2)
+print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checkpoint saved to {checkpoint_file}\n")
+
+# Plot the curves
+plt.figure(figsize=(12, 7))
+plt.plot(depths, xgb_depths_scores, marker='o', linewidth=2.5, label='XGBoost', color='#FF6B6B', markersize=6)
+plt.plot(depths, catboost_depths_scores, marker='s', linewidth=2.5, label='CatBoost', color='#4ECDC4', markersize=6)
+plt.plot(depths, lightgbm_depths_scores, marker='^', linewidth=2.5, label='LightGBM', color='#45B7D1', markersize=6)
+plt.plot(gb_depths_limited, gb_depths_scores, marker='D', linewidth=2.5, label='Gradient Boosting (3 depths)', color='#F7DC6F', markersize=6)
+
+plt.xlabel('Max Depth', fontsize=12, fontweight='bold')
+plt.ylabel('Mean CV R² Score (5-Fold)', fontsize=12, fontweight='bold')
+plt.title('Cross-Validation Curves: Boosting Models Across Depth Parameters', fontsize=14, fontweight='bold')
+plt.legend(fontsize=11, loc='best')
+plt.grid(True, alpha=0.3, linestyle='--')
+plt.xticks(depths)
+plt.tight_layout()
+plt.savefig('results_logs/cv_curves_depth_comparison.png', dpi=300, bbox_inches='tight')
+print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Plot saved to results_logs/cv_curves_depth_comparison.png")
+plt.show()
+
+# Print summary statistics
+print("\n==============|Depth Analysis Summary|==============")
+print(f"XGBoost Best Depth: {depths[np.argmax(xgb_depths_scores)]} with R²: {max(xgb_depths_scores):.6f}")
+print(f"CatBoost Best Depth: {depths[np.argmax(catboost_depths_scores)]} with R²: {max(catboost_depths_scores):.6f}")
+print(f"LightGBM Best Depth: {depths[np.argmax(lightgbm_depths_scores)]} with R²: {max(lightgbm_depths_scores):.6f}")
+print(f"Gradient Boosting Best Depth: {gb_depths_limited[np.argmax(gb_depths_scores)]} with R²: {max(gb_depths_scores):.6f}")
 
