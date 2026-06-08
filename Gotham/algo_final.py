@@ -1,10 +1,6 @@
-# Imports
-from enum import IntEnum
-from dataclasses import dataclass
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
-from datetime import date, datetime, timedelta
+from datetime import datetime
 import json
 import os
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet, LassoCV
@@ -13,7 +9,6 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import KFold, cross_val_score, GridSearchCV, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.pipeline import Pipeline
-from sklearn.inspection import permutation_importance
 from sklearn.ensemble import GradientBoostingRegressor
 import warnings
 warnings.filterwarnings('ignore')
@@ -32,28 +27,31 @@ from optuna.samplers import TPESampler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 
-from ISLP.models import (ModelSpec as MS, summarize)
+import matplotlib.pyplot as plt
+    
 
 sample_frac = 0.3
 # ============== MODEL TOGGLES ==============
-ENABLE_LINEAR_REGRESSION = False
-ENABLE_RIDGE_REGRESSION = False
+ENABLE_LINEAR_REGRESSION = True
+ENABLE_RIDGE_REGRESSION = True
 ENABLE_LASSO_REGRESSION = False
 ENABLE_NEURAL_NETWORK = False
 
     # Tree-based models
-ENABLE_RANDOM_FOREST = False
+ENABLE_RANDOM_FOREST = True
 ENABLE_DECISION_TREE = False
 ENABLE_GRADIENT_BOOSTING = False
 ENABLE_ADABOOST = False
-ENABLE_XGBOOST = False
+ENABLE_XGBOOST = True
 ENABLE_CATBOOST = False
-ENABLE_LIGHTGBM = False
+ENABLE_LIGHTGBM = True
 
 # Advanced sections
-ENABLE_CV_CURVES = False
+ENABLE_CV_CURVES = True
 ENABLE_FULL_TRAINING = True
-ENABLE_FEATURE_SELECTION = False  # Set to True to use only top 30 features
+ENABLE_FEATURE_SELECTION = True  # Set to True to use only top 30 features
+ENABLE_FEATURE_REFINE = True
+ENABLE_FINAL_TEST = True
 # ============================================
 
 def parseDateTime(dateString):
@@ -64,7 +62,17 @@ def parseDateTime(dateString):
         s = str(dateString).strip()
         if ',' in s:
             s = s.split(',', 1)[0].strip()
-        return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+        
+        # Try multiple datetime formats (training data format first, then test data format)
+        formats = ['%Y-%m-%d %H:%M:%S', '%m/%d/%y %H:%M']
+        for fmt in formats:
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        
+        # If none of the formats work, raise an error
+        raise ValueError(f"Failed to parse datetime string '{dateString}' with any supported format: {formats}")
     except Exception as e:
         raise ValueError(f"Failed to parse datetime string '{dateString}': {e}")
 
@@ -210,7 +218,7 @@ def setup_features(df, sample_fraction=None):
     taxi['euclidean_distance'] = np.sqrt(taxi['x2xDistance'] ** 2 + taxi['y2yDistance'] ** 2)
     taxi['euclidean_distance_squared'] = taxi['euclidean_distance'] ** 2
     taxi['euclidean_distance_cubed'] = taxi['euclidean_distance'] ** 3
-    taxi['distance_category'] = pd.cut(taxi['euclidean_distance'], bins=[0, 1, 2, 5, 10, float('inf')], labels=['very_short', 'short', 'medium', 'long', 'very_long']).cat.codes
+    taxi['distance_category'] = pd.cut(taxi['euclidean_distance'], bins=[0, 0.5, 1, 2, 5, 10, float('inf')], labels=['very_short', 'short', 'medium', 'long', 'very_long', 'very_long_plus']).cat.codes
 
         # Relating distances to potentially related metrics
     taxi['distance_x_timeOfDay'] = taxi['x2xDistance'] * taxi['timeOfDay']
@@ -293,9 +301,12 @@ print('==============|Preparing Data|==============')
 df = pd.read_csv('Train.csv')
 
 taxi = setup_features(df)
-scaler = StandardScaler()
 x_raw = taxi[features]
-x = scaler.fit_transform(x_raw)
+x = x_raw  # Used for tree models
+
+# USed for linear models and neural network
+scaler = StandardScaler()
+x_scaled = scaler.fit_transform(x_raw)
 
 y = taxi['duration']
 
@@ -311,7 +322,7 @@ if ENABLE_FEATURE_SELECTION or ENABLE_LINEAR_REGRESSION:
     # Train quick linear regression to identify top features
     print("Identifying top features using linear regression...")
     linear_selector = LinearRegression()
-    linear_selector.fit(x, y)
+    linear_selector.fit(x_scaled, y)
     
     # Get feature importances (absolute coefficients)
     feature_importance = np.abs(linear_selector.coef_)
@@ -331,7 +342,8 @@ if ENABLE_FEATURE_SELECTION or ENABLE_LINEAR_REGRESSION:
     print(importance_df.head(30)[['Feature', 'Coefficient', 'Abs_Coefficient']].to_string(index=False))
     
     selected_features = top_30_features
-    x = x[:, top_30_indices]
+    x = x.iloc[:, top_30_indices]
+    x_scaled = x_scaled[:, top_30_indices]
     print(f"\n*** Using TOP 30 FEATURES for all model evaluations ***\n")
 
 if ENABLE_LINEAR_REGRESSION:
@@ -339,10 +351,9 @@ if ENABLE_LINEAR_REGRESSION:
     
     # Linear Regression with 5-fold cross-validation
     linear_model = LinearRegression()
-    linear_cv_scores = cross_val_score(linear_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+    linear_cv_scores = cross_val_score(linear_model, x_scaled, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
 
-    print(f"Linear Mean CV R²: {linear_cv_scores.mean():.6f}")
-    print(f"Linear Std Dev CV R²: {linear_cv_scores.std():.6f}\n")
+    print(f"Linear Mean CV R²: {linear_cv_scores.mean():.6f}\n")
 
 if ENABLE_RIDGE_REGRESSION:
     print('==============|Ridge Regression|==============')
@@ -354,44 +365,39 @@ if ENABLE_RIDGE_REGRESSION:
         ('ridge', Ridge())
     ])
 
-    # GridSearchCV for optomization
     ridge_grid = GridSearchCV(ridge_pipeline, {'ridge__alpha': ridge_alphas}, cv=5, scoring='r2', n_jobs=12)
-    ridge_grid.fit(x, y)
+    ridge_grid.fit(x_scaled, y)
 
     print(f"Best Ridge Alpha: {ridge_grid.best_params_['ridge__alpha']:.6f}")
     print(f"Best Ridge CV R² Score: {ridge_grid.best_score_:.6f}")
 
     # Evaluate best Ridge model with k-fold
     ridge_best = Ridge(alpha=ridge_grid.best_params_['ridge__alpha'])
-    ridge_cv_scores = cross_val_score(ridge_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-    print(f"Ridge CV R² Scores (5 folds): {ridge_cv_scores}")
+    ridge_cv_scores = cross_val_score(ridge_best, x_scaled, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
     print(f"Ridge Mean CV R²: {ridge_cv_scores.mean():.6f}")
-    print(f"Ridge Std Dev CV R²: {ridge_cv_scores.std():.6f}")
 
 if ENABLE_LASSO_REGRESSION:
     print('==============|Lasso Regression|==============')
     
     # LassoCV for optomization 
     lasso_cv = LassoCV(
-        alphas=np.logspace(-4, 2, 50),  # 50 alpha values (fast!)
+        alphas=np.logspace(-4, 2, 50), 
         cv=5,
         max_iter=5000,
-        n_jobs=-1,  # Use all CPU cores
+        n_jobs=-1,
         random_state=42,
         verbose=0
     )
     
-    lasso_cv.fit(x, y)
+    lasso_cv.fit(x_scaled, y)
     
     print(f"Best Lasso Alpha: {lasso_cv.alpha_:.6f}")
-    print(f"Lasso CV R² Score: {lasso_cv.score(x, y):.6f}")
+    print(f"Lasso CV R² Score: {lasso_cv.score(x_scaled, y):.6f}")
     
     # Evaluate best Lasso model with k-fold
     lasso_best = Lasso(alpha=lasso_cv.alpha_, max_iter=5000)
-    lasso_cv_scores = cross_val_score(lasso_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-    print(f"Lasso CV R² Scores (5 folds): {lasso_cv_scores}")
+    lasso_cv_scores = cross_val_score(lasso_best, x_scaled, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
     print(f"Lasso Mean CV R²: {lasso_cv_scores.mean():.6f}")
-    print(f"Lasso Std Dev CV R²: {lasso_cv_scores.std():.6f}")
 
 if ENABLE_NEURAL_NETWORK:
     print('==============|Neural Network|==============')
@@ -493,9 +499,9 @@ if ENABLE_NEURAL_NETWORK:
         cv_scores = []
         kfold = KFold(n_splits=3, shuffle=True, random_state=42)
         
-        for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(x)):
-            X_train_fold = x[train_idx]
-            X_val_fold = x[val_idx]
+        for fold_idx, (train_idx, val_idx) in enumerate(kfold.split(x_scaled)):
+            X_train_fold = x_scaled[train_idx]
+            X_val_fold = x_scaled[val_idx]
             y_train_fold = y.values[train_idx]
             y_val_fold = y.values[val_idx]
             
@@ -564,9 +570,7 @@ if ENABLE_RANDOM_FOREST:
     )
 
     rf_cv_scores = cross_val_score(rf_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
-    print(f"\nRandom Forest CV R² Scores (5 folds): {rf_cv_scores}")
-    print(f"Random Forest Mean CV R²: {rf_cv_scores.mean():.6f}")
-    print(f"Random Forest Std Dev CV R²: {rf_cv_scores.std():.6f}")
+    print(f"\nRandom Forest Mean CV R²: {rf_cv_scores.mean():.6f}")
 
 if ENABLE_DECISION_TREE:
     print('==============|Decision Tree|==============\n')
@@ -609,9 +613,7 @@ if ENABLE_DECISION_TREE:
     )
 
     dt_cv_scores = cross_val_score(dt_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-    print(f"\nDecision Tree CV R² Scores (5 folds): {dt_cv_scores}")
-    print(f"Decision Tree Mean CV R²: {dt_cv_scores.mean():.6f}")
-    print(f"Decision Tree Std Dev CV R²: {dt_cv_scores.std():.6f}\n")
+    print(f"\nDecision Tree Mean CV R²: {dt_cv_scores.mean():.6f}\n")
 
 if ENABLE_GRADIENT_BOOSTING:
     print('==============|Gradient Boosting|==============\n')
@@ -619,7 +621,7 @@ if ENABLE_GRADIENT_BOOSTING:
     def gb_objective(trial):
         n_estimators = trial.suggest_int('n_estimators', 50, 300)
         learning_rate = trial.suggest_float('learning_rate', 0.001, 0.1, log=True)
-        max_depth = trial.suggest_int('max_depth', 3, 10)
+        max_depth = trial.suggest_int('max_depth', 3, 15)
         min_samples_split = trial.suggest_int('min_samples_split', 2, 20)
         min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 8)
         subsample = trial.suggest_float('subsample', 0.6, 1.0)
@@ -660,9 +662,7 @@ if ENABLE_GRADIENT_BOOSTING:
     )
 
     gb_cv_scores = cross_val_score(gb_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-    print(f"\nGradient Boosting CV R² Scores (5 folds): {gb_cv_scores}")
-    print(f"Gradient Boosting Mean CV R²: {gb_cv_scores.mean():.6f}")
-    print(f"Gradient Boosting Std Dev CV R²: {gb_cv_scores.std():.6f}\n")
+    print(f"\nGradient Boosting Mean CV R²: {gb_cv_scores.mean():.6f}\n")
 
 if ENABLE_ADABOOST:
     print('==============|AdaBoost|==============\n')
@@ -702,9 +702,7 @@ if ENABLE_ADABOOST:
     )
 
     ab_cv_scores = cross_val_score(ab_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-    print(f"\nAdaBoost CV R² Scores (5 folds): {ab_cv_scores}")
-    print(f"AdaBoost Mean CV R²: {ab_cv_scores.mean():.6f}")
-    print(f"AdaBoost Std Dev CV R²: {ab_cv_scores.std():.6f}\n")
+    print(f"\nAdaBoost Mean CV R²: {ab_cv_scores.mean():.6f}\n")
 
 if ENABLE_XGBOOST:
     print('==============|XGBoost|==============\n')
@@ -712,10 +710,13 @@ if ENABLE_XGBOOST:
     def xgb_objective(trial):
         n_estimators = trial.suggest_int('n_estimators', 50, 300)
         learning_rate = trial.suggest_float('learning_rate', 0.001, 0.3, log=True)
-        max_depth = trial.suggest_int('max_depth', 3, 10)
+        max_depth = trial.suggest_int('max_depth', 3, 15)
         min_child_weight = trial.suggest_int('min_child_weight', 1, 7)
         subsample = trial.suggest_float('subsample', 0.6, 1.0)
         colsample_bytree = trial.suggest_float('colsample_bytree', 0.6, 1.0)
+        gamma = trial.suggest_float('gamma', 0, 5)
+        reg_alpha = trial.suggest_float('reg_alpha', 0, 1)
+        reg_lambda = trial.suggest_float('reg_lambda', 0, 10)
         
         xgb_model = xgb.XGBRegressor(
             n_estimators=n_estimators,
@@ -724,6 +725,9 @@ if ENABLE_XGBOOST:
             min_child_weight=min_child_weight,
             subsample=subsample,
             colsample_bytree=colsample_bytree,
+            gamma=gamma,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
             random_state=42,
             n_jobs=12,
             verbosity=0
@@ -751,15 +755,22 @@ if ENABLE_XGBOOST:
         min_child_weight=best_xgb_trial.params['min_child_weight'],
         subsample=best_xgb_trial.params['subsample'],
         colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+        gamma=best_xgb_trial.params.get('gamma', 0),
+        reg_alpha=best_xgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_xgb_trial.params.get('reg_lambda', 1),
         random_state=42,
         n_jobs=12,
         verbosity=0
     )
 
     xgb_cv_scores = cross_val_score(xgb_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
-    print(f"\nXGBoost CV R² Scores (5 folds): {xgb_cv_scores}")
-    print(f"XGBoost Mean CV R²: {xgb_cv_scores.mean():.6f}")
-    print(f"XGBoost Std Dev CV R²: {xgb_cv_scores.std():.6f}\n")
+    print(f"\nXGBoost Mean CV R²: {xgb_cv_scores.mean():.6f}\n")
+    
+    # Save best parameters to JSON
+    xgb_params_file = 'results_logs/best_xgboost_params.json'
+    with open(xgb_params_file, 'w') as f:
+        json.dump({'params': best_xgb_trial.params, 'r2_score': best_xgb_trial.value}, f, indent=2)
+    print(f"Saved XGBoost best parameters to {xgb_params_file}\n")
 
 if ENABLE_CATBOOST:
     print('==============|CatBoost|==============\n')
@@ -804,9 +815,7 @@ if ENABLE_CATBOOST:
     )
 
     cb_cv_scores = cross_val_score(cb_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-    print(f"\nCatBoost CV R² Scores (5 folds): {cb_cv_scores}")
-    print(f"CatBoost Mean CV R²: {cb_cv_scores.mean():.6f}")
-    print(f"CatBoost Std Dev CV R²: {cb_cv_scores.std():.6f}\n")
+    print(f"\nCatBoost Mean CV R²: {cb_cv_scores.mean():.6f}\n")
 
 if ENABLE_LIGHTGBM:
     print('==============|LightGBM|==============\n')
@@ -817,6 +826,9 @@ if ENABLE_LIGHTGBM:
         num_leaves = trial.suggest_int('num_leaves', 20, 100)
         min_child_samples = trial.suggest_int('min_child_samples', 5, 50)
         subsample = trial.suggest_float('subsample', 0.6, 1.0)
+        feature_fraction = trial.suggest_float('feature_fraction', 0.5, 1.0)
+        reg_alpha = trial.suggest_float('reg_alpha', 0, 1)
+        reg_lambda = trial.suggest_float('reg_lambda', 0, 10)
         
         lgb_model = lgb.LGBMRegressor(
             n_estimators=n_estimators,
@@ -824,6 +836,9 @@ if ENABLE_LIGHTGBM:
             num_leaves=num_leaves,
             min_child_samples=min_child_samples,
             subsample=subsample,
+            feature_fraction=feature_fraction,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda,
             random_state=42,
             n_jobs=12,
             verbose=-1
@@ -850,15 +865,22 @@ if ENABLE_LIGHTGBM:
         num_leaves=best_lgb_trial.params['num_leaves'],
         min_child_samples=best_lgb_trial.params['min_child_samples'],
         subsample=best_lgb_trial.params['subsample'],
+        feature_fraction=best_lgb_trial.params.get('feature_fraction', 1.0),
+        reg_alpha=best_lgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_lgb_trial.params.get('reg_lambda', 1),
         random_state=42,
         n_jobs=12,
         verbose=-1
     )
 
     lgb_cv_scores = cross_val_score(lgb_best, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
-    print(f"\nLightGBM CV R² Scores (5 folds): {lgb_cv_scores}")
-    print(f"LightGBM Mean CV R²: {lgb_cv_scores.mean():.6f}")
-    print(f"LightGBM Std Dev CV R²: {lgb_cv_scores.std():.6f}\n")
+    print(f"\nLightGBM Mean CV R²: {lgb_cv_scores.mean():.6f}\n")
+    
+    # Save best parameters to JSON
+    lgb_params_file = 'results_logs/best_lightgbm_params.json'
+    with open(lgb_params_file, 'w') as f:
+        json.dump({'params': best_lgb_trial.params, 'r2_score': best_lgb_trial.value}, f, indent=2)
+    print(f"Saved LightGBM best parameters to {lgb_params_file}\n")
 
 
 # Store pre-computed best trial values from previous runs
@@ -867,7 +889,53 @@ class BestTrialMock:
         self.params = params_dict
         self.value = value
 
-# Best Trial Values from Previous Runs
+def load_best_params(model_name, default_params):
+    """Load best parameters from JSON file, with fallback to defaults"""
+    params_file = f'results_logs/best_{model_name}_params.json'
+    
+    if os.path.exists(params_file):
+        try:
+            with open(params_file, 'r') as f:
+                data = json.load(f)
+                params = data.get('params', default_params)
+                r2_score = data.get('r2_score', None)
+                print(f"Loaded {model_name} best parameters from {params_file}")
+                if r2_score:
+                    print(f"  Previous best R² score: {r2_score:.6f}")
+                return BestTrialMock(params, r2_score)
+        except Exception as e:
+            print(f"Failed to load {model_name} parameters from {params_file}: {e}")
+            print(f"  Using default fallback parameters")
+            return BestTrialMock(default_params)
+    else:
+        print(f"{params_file} not found, using default fallback parameters")
+        return BestTrialMock(default_params)
+
+# Load best parameters from JSON or use defaults
+best_xgb_trial = load_best_params('xgboost', {
+    'n_estimators': 250,
+    'learning_rate': 0.1,
+    'max_depth': 11,
+    'min_child_weight': 5,
+    'subsample': 1.0,
+    'colsample_bytree': 0.9,
+    'gamma': 0,
+    'reg_alpha': 0.1,
+    'reg_lambda': 1
+})
+
+best_lgb_trial = load_best_params('lightgbm', {
+    'n_estimators': 144,
+    'learning_rate': 0.22648248189516848,
+    'num_leaves': 79,
+    'min_child_samples': 32,
+    'subsample': 0.6624074561769746,
+    'feature_fraction': 1.0,
+    'reg_alpha': 0,
+    'reg_lambda': 1
+})
+
+# Support for other models (not used in full training, but kept for completeness)
 best_rf_trial = BestTrialMock({
     'n_estimators': 271,
     'max_depth': 24,
@@ -892,15 +960,6 @@ best_gb_trial = BestTrialMock({
     'subsample': 0.662397808134481
 })
 
-best_xgb_trial = BestTrialMock({
-    'n_estimators': 144,
-    'learning_rate': 0.22648248189516848,
-    'max_depth': 8,
-    'min_child_weight': 5,
-    'subsample': 0.6624074561769746,
-    'colsample_bytree': 0.662397808134481
-})
-
 best_cb_trial = BestTrialMock({
     'iterations': 144,
     'learning_rate': 0.22648248189516848,
@@ -908,20 +967,11 @@ best_cb_trial = BestTrialMock({
     'l2_leaf_reg': 6.387926357773329
 })
 
-best_lgb_trial = BestTrialMock({
-    'n_estimators': 144,
-    'learning_rate': 0.22648248189516848,
-    'num_leaves': 79,
-    'min_child_samples': 32,
-    'subsample': 0.6624074561769746
-})
-
 # Cross Validation Curves of top 4 R^2 models
 if ENABLE_CV_CURVES:
     print('==============|Cross-Validation Curves: Depth Analysis|==============\n')
 
-    import matplotlib.pyplot as plt
-    from datetime import datetime
+
 
     # Define depth range
     depths = list(range(1, 15))  # 2 to 17 inclusive
@@ -953,6 +1003,9 @@ if ENABLE_CV_CURVES:
                 min_child_weight=best_xgb_trial.params['min_child_weight'],
                 subsample=best_xgb_trial.params['subsample'],
                 colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+                gamma=best_xgb_trial.params.get('gamma', 0),
+                reg_alpha=best_xgb_trial.params.get('reg_alpha', 0),
+                reg_lambda=best_xgb_trial.params.get('reg_lambda', 1),
                 random_state=42,
                 n_jobs=12,
                 verbosity=0
@@ -996,6 +1049,9 @@ if ENABLE_CV_CURVES:
                 num_leaves=2**depth,  # LightGBM uses num_leaves instead of max_depth
                 min_child_samples=best_lgb_trial.params['min_child_samples'],
                 subsample=best_lgb_trial.params['subsample'],
+                feature_fraction=best_lgb_trial.params.get('feature_fraction', 1.0),
+                reg_alpha=best_lgb_trial.params.get('reg_alpha', 0),
+                reg_lambda=best_lgb_trial.params.get('reg_lambda', 1),
                 random_state=42,
                 n_jobs=12,
                 verbose=-1
@@ -1068,8 +1124,8 @@ if ENABLE_FULL_TRAINING:
     df_full = pd.read_csv('Train.csv')
     taxi_full = setup_features(df_full, sample_fraction=1.0)
     x_full_raw = taxi_full[features]
-    # scaler_full = StandardScaler()
-    x_full = x_full_raw #scaler_full.fit_transform(x_full_raw)
+    scaler_full = StandardScaler()
+    x_full = scaler_full.fit_transform(x_full_raw)
     y_full = taxi_full['duration']
     
     # Train XGBoost on full data
@@ -1081,6 +1137,9 @@ if ENABLE_FULL_TRAINING:
         min_child_weight=best_xgb_trial.params['min_child_weight'],
         subsample=best_xgb_trial.params['subsample'],
         colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+        gamma=best_xgb_trial.params.get('gamma', 0),
+        reg_alpha=best_xgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_xgb_trial.params.get('reg_lambda', 1),
         random_state=42,
         n_jobs=12,
         verbosity=0
@@ -1088,7 +1147,9 @@ if ENABLE_FULL_TRAINING:
     xgb_full.fit(x_full, y_full)
     xgb_full_pred = xgb_full.predict(x_full)
     xgb_full_r2 = r2_score(y_full, xgb_full_pred)
+    xgb_full_rmse = np.sqrt(mean_squared_error(y_full, xgb_full_pred))
     print(f"XGBoost R² on full data: {xgb_full_r2:.6f}\n")
+    print(f"XGBoost RMSE on full data: {xgb_full_rmse:.4f}\n")
     
     # Train LightGBM on full data
     print("Training LightGBM on 100% data...")
@@ -1098,6 +1159,9 @@ if ENABLE_FULL_TRAINING:
         num_leaves=best_lgb_trial.params['num_leaves'],
         min_child_samples=best_lgb_trial.params['min_child_samples'],
         subsample=best_lgb_trial.params['subsample'],
+        feature_fraction=best_lgb_trial.params.get('feature_fraction', 1.0),
+        reg_alpha=best_lgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_lgb_trial.params.get('reg_lambda', 1),
         random_state=42,
         n_jobs=12,
         verbose=-1
@@ -1105,7 +1169,9 @@ if ENABLE_FULL_TRAINING:
     lgb_full.fit(x_full, y_full)
     lgb_full_pred = lgb_full.predict(x_full)
     lgb_full_r2 = r2_score(y_full, lgb_full_pred)
+    lgb_full_rmse = np.sqrt(mean_squared_error(y_full, lgb_full_pred))
     print(f"LightGBM R² on full data: {lgb_full_r2:.6f}\n")
+    print(f"LightGBM RMSE on full data: {lgb_full_rmse:.4f}\n")
     
     # Extract feature importances (built-in to models)
     print("==============|Feature Importance Analysis|==============\n")
@@ -1174,8 +1240,7 @@ if ENABLE_FULL_TRAINING:
     print(f"Hyperparameters saved to: {hyperparams_file}\n")
     
     # Plot feature importance comparison - ALL features
-    import matplotlib.pyplot as plt
-    
+
     all_features_df = feature_importance_df
     
     fig, axes = plt.subplots(1, 2, figsize=(18, max(10, len(all_features_df) * 0.25)))
@@ -1233,3 +1298,607 @@ if ENABLE_FULL_TRAINING:
     print(f"Number of moderately important features (0.5%-1% avg importance): {len(feature_importance_df[(feature_importance_df['Average_Importance'] > 0.005) & (feature_importance_df['Average_Importance'] <= 0.01)])}")
     print(f"Number of low importance features (<0.5% avg importance): {len(feature_importance_df[feature_importance_df['Average_Importance'] <= 0.005])}")
 
+if ENABLE_FULL_TRAINING:
+    print("\n\n==============|Full 100% Data Training with Feature Selection|==============\n")
+
+
+
+    # Reload full dataset with all features
+    df_full = pd.read_csv('Train.csv')
+    taxi_full = setup_features(df_full, sample_fraction=1.0)
+    x_full_raw = taxi_full[features]
+    # scaler_full = StandardScaler()
+    x_full = x_full_raw  # scaler_full.fit_transform(x_full_raw)
+    y_full = taxi_full['duration']
+
+    cv5 = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    # ------------------------------------------------------------------
+    # XGBoost - 5-fold CV for R2, then full-data fit for importances
+    # ------------------------------------------------------------------
+    print("Training XGBoost on 100% data (5-fold CV)...")
+    xgb_full = xgb.XGBRegressor(
+        n_estimators=best_xgb_trial.params['n_estimators'],
+        learning_rate=best_xgb_trial.params['learning_rate'],
+        max_depth=best_xgb_trial.params['max_depth'],
+        min_child_weight=best_xgb_trial.params['min_child_weight'],
+        subsample=best_xgb_trial.params['subsample'],
+        colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+        gamma=best_xgb_trial.params.get('gamma', 0),
+        reg_alpha=best_xgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_xgb_trial.params.get('reg_lambda', 1),
+        random_state=42,
+        n_jobs=12,
+        verbosity=0
+    )
+
+    xgb_cv_r2_scores   = cross_val_score(xgb_full, x_full, y_full, cv=cv5, scoring='r2')
+    xgb_cv_rmse_scores = np.sqrt(-cross_val_score(xgb_full, x_full, y_full, cv=cv5, scoring='neg_mean_squared_error'))
+    xgb_full_r2   = xgb_cv_r2_scores.mean()
+    xgb_full_rmse = xgb_cv_rmse_scores.mean()
+
+    print(f"XGBoost CV R²: {xgb_full_r2:.6f}")
+    print(f"XGBoost CV RMSE: {xgb_full_rmse:.4f}")
+
+    # Fit on full data to extract feature importances
+    xgb_full.fit(x_full, y_full)
+    print()
+
+    # ------------------------------------------------------------------
+    # LightGBM - 5-fold CV for R2, then full-data fit for importances
+    # ------------------------------------------------------------------
+    print("Training LightGBM on 100% data (5-fold CV)...")
+    lgb_full = lgb.LGBMRegressor(
+        n_estimators=best_lgb_trial.params['n_estimators'],
+        learning_rate=best_lgb_trial.params['learning_rate'],
+        num_leaves=best_lgb_trial.params['num_leaves'],
+        min_child_samples=best_lgb_trial.params['min_child_samples'],
+        subsample=best_lgb_trial.params['subsample'],
+        feature_fraction=best_lgb_trial.params.get('feature_fraction', 1.0),
+        reg_alpha=best_lgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_lgb_trial.params.get('reg_lambda', 1),
+        random_state=42,
+        n_jobs=12,
+        verbose=-1
+    )
+
+    lgb_cv_r2_scores   = cross_val_score(lgb_full, x_full, y_full, cv=cv5, scoring='r2')
+    lgb_cv_rmse_scores = np.sqrt(-cross_val_score(lgb_full, x_full, y_full, cv=cv5, scoring='neg_mean_squared_error'))
+    lgb_full_r2   = lgb_cv_r2_scores.mean()
+    lgb_full_rmse = lgb_cv_rmse_scores.mean()
+
+    print(f"LightGBM CV R²: {lgb_full_r2:.6f}")
+    print(f"LightGBM CV RMSE: {lgb_full_rmse:.4f}")
+
+    # Fit on full data to extract feature importances
+    lgb_full.fit(x_full, y_full)
+    print()
+
+    # ------------------------------------------------------------------
+    # Feature importances from the full-data fits
+    # ------------------------------------------------------------------
+    print("==============|Feature Importance Analysis|==============\n")
+
+    xgb_importance = xgb_full.feature_importances_
+    lgb_importance = lgb_full.feature_importances_
+
+    feature_importance_df = pd.DataFrame({
+        'Feature': features,
+        'XGBoost_Importance': xgb_importance,
+        'LightGBM_Importance': lgb_importance,
+    })
+
+    # Normalize importances to 0-1 scale for easier comparison
+    xgb_norm = xgb_importance / np.sum(xgb_importance)
+    lgb_norm  = lgb_importance / np.sum(lgb_importance)
+
+    feature_importance_df['XGBoost_Normalized']  = xgb_norm
+    feature_importance_df['LightGBM_Normalized'] = lgb_norm
+    feature_importance_df['Average_Importance']  = (xgb_norm + lgb_norm) / 2
+
+    feature_importance_df = feature_importance_df.sort_values('Average_Importance', ascending=False)
+
+    print("ALL Features Ranked by Average Importance:\n")
+    print(feature_importance_df[['Feature', 'XGBoost_Normalized', 'LightGBM_Normalized', 'Average_Importance']].to_string(index=False))
+    print()
+
+    # Save feature importance to CSV
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    importance_file = f'results_logs/feature_importance_full_training_{timestamp}.csv'
+    feature_importance_df.to_csv(importance_file, index=False)
+    print(f"\nFull feature importance saved to: {importance_file}")
+
+    # Save model hyperparameters + CV results
+    hyperparams_file = f'results_logs/final_hyperparameters_full_training_{timestamp}.json'
+    hyperparams = {
+        'XGBoost': {
+            'n_estimators':    best_xgb_trial.params['n_estimators'],
+            'learning_rate':   best_xgb_trial.params['learning_rate'],
+            'max_depth':       best_xgb_trial.params['max_depth'],
+            'min_child_weight':best_xgb_trial.params['min_child_weight'],
+            'subsample':       best_xgb_trial.params['subsample'],
+            'colsample_bytree':best_xgb_trial.params['colsample_bytree'],
+            'cv_r2_mean':  float(xgb_full_r2),
+            'cv_r2_std':   float(xgb_cv_r2_scores.std()),
+            'cv_rmse_mean':float(xgb_full_rmse),
+            'cv_rmse_std': float(xgb_cv_rmse_scores.std()),
+            'cv_r2_folds': xgb_cv_r2_scores.tolist(),
+            'cv_rmse_folds':xgb_cv_rmse_scores.tolist(),
+        },
+        'LightGBM': {
+            'n_estimators':    best_lgb_trial.params['n_estimators'],
+            'learning_rate':   best_lgb_trial.params['learning_rate'],
+            'num_leaves':      best_lgb_trial.params['num_leaves'],
+            'min_child_samples':best_lgb_trial.params['min_child_samples'],
+            'subsample':       best_lgb_trial.params['subsample'],
+            'cv_r2_mean':  float(lgb_full_r2),
+            'cv_r2_std':   float(lgb_cv_r2_scores.std()),
+            'cv_rmse_mean':float(lgb_full_rmse),
+            'cv_rmse_std': float(lgb_cv_rmse_scores.std()),
+            'cv_r2_folds': lgb_cv_r2_scores.tolist(),
+            'cv_rmse_folds':lgb_cv_rmse_scores.tolist(),
+        },
+        'training_info': {
+            'cv_folds':       5,
+            'total_samples':  len(taxi_full),
+            'total_features': len(features),
+            'timestamp':      timestamp
+        }
+    }
+
+    with open(hyperparams_file, 'w') as f:
+        json.dump(hyperparams, f, indent=2)
+    print(f"Hyperparameters saved to: {hyperparams_file}\n")
+
+    # Plot feature importance comparison - ALL features
+
+
+    all_features_df = feature_importance_df
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, max(10, len(all_features_df) * 0.25)))
+
+    axes[0].barh(range(len(all_features_df)), all_features_df['XGBoost_Normalized'], color='#FF6B6B')
+    axes[0].set_yticks(range(len(all_features_df)))
+    axes[0].set_yticklabels(all_features_df['Feature'], fontsize=9)
+    axes[0].set_xlabel('Normalized Importance', fontsize=11, fontweight='bold')
+    axes[0].set_title(f'XGBoost Feature Importance (All {len(all_features_df)} Features)', fontsize=12, fontweight='bold')
+    axes[0].invert_yaxis()
+    axes[0].grid(axis='x', alpha=0.3)
+
+    axes[1].barh(range(len(all_features_df)), all_features_df['LightGBM_Normalized'], color='#45B7D1')
+    axes[1].set_yticks(range(len(all_features_df)))
+    axes[1].set_yticklabels(all_features_df['Feature'], fontsize=9)
+    axes[1].set_xlabel('Normalized Importance', fontsize=11, fontweight='bold')
+    axes[1].set_title(f'LightGBM Feature Importance (All {len(all_features_df)} Features)', fontsize=12, fontweight='bold')
+    axes[1].invert_yaxis()
+    axes[1].grid(axis='x', alpha=0.3)
+
+    plt.tight_layout()
+
+    plot_file = f'results_logs/feature_importance_comparison_ALL_{timestamp}.png'
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    print(f"Feature importance plot (ALL features) saved to: {plot_file}\n")
+    plt.show()
+
+    # Summary statistics
+    print("Feature Selection Summary")
+    print(f"\nXGBoost CV R²: {xgb_full_r2:.6f}  CV RMSE: {xgb_full_rmse:.4f}")
+    print(f"LightGBM CV R²: {lgb_full_r2:.6f}  CV RMSE: {lgb_full_rmse:.4f}")
+    print(f"Better Model (CV R²): {'XGBoost' if xgb_full_r2 > lgb_full_r2 else 'LightGBM'} ({max(xgb_full_r2, lgb_full_r2):.6f})")
+    print(f"\nTotal Features Analyzed: {len(features)}")
+    print(f"Top 5 Consensus Features (by average importance):")
+    for i, row in feature_importance_df.head(5).iterrows():
+        print(f"  {i+1}. {row['Feature']:30s} - Avg Importance: {row['Average_Importance']:.6f}")
+
+    # Feature removal analysis
+    print("\n==============|Feature Removal Analysis|==============")
+
+    thresholds = [0.005, 0.01, 0.02, 0.05]
+
+    print("\nFeatures that could be removed (by importance threshold):")
+    for threshold in thresholds:
+        removable = feature_importance_df[feature_importance_df['Average_Importance'] <= threshold]
+        print(f"\n  Below {threshold*100:.1f}% avg importance: {len(removable)} features")
+        if len(removable) > 0:
+            for idx, row in removable.iterrows():
+                print(f"    - {row['Feature']:30s} : {row['Average_Importance']:.6f}")
+
+    print(f"\nNumber of highly important features   (>1% avg importance): {len(feature_importance_df[feature_importance_df['Average_Importance'] > 0.01])}")
+    print(f"Number of moderately important features (0.5%-1% avg importance): {len(feature_importance_df[(feature_importance_df['Average_Importance'] > 0.005) & (feature_importance_df['Average_Importance'] <= 0.01)])}")
+    print(f"Number of low importance features       (<0.5% avg importance): {len(feature_importance_df[feature_importance_df['Average_Importance'] <= 0.005])}")
+
+
+
+if ENABLE_FEATURE_REFINE:
+    print("\n\n==============|Feature Refinement - Drop Low-Importance Features|==============\n")
+
+    cv5 = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    # ------------------------------------------------------------------
+    # 1.  Classify every feature into the three importance tiers
+    # ------------------------------------------------------------------
+    HIGH_THRESH = 0.01
+    MOD_THRESH  = 0.005 
+
+    def classify_importance(val):
+        if val > HIGH_THRESH:
+            return 'High'
+        elif val > MOD_THRESH:
+            return 'Moderate'
+        else:
+            return 'Low'
+
+    feature_importance_df['XGBoost_Tier']  = feature_importance_df['XGBoost_Normalized'].apply(classify_importance)
+    feature_importance_df['LightGBM_Tier'] = feature_importance_df['LightGBM_Normalized'].apply(classify_importance)
+    feature_importance_df['Average_Tier']  = feature_importance_df['Average_Importance'].apply(classify_importance)
+
+    # ------------------------------------------------------------------
+    # 2.  Log each tier for XGBoost, LightGBM, and Average
+    # ------------------------------------------------------------------
+    for model_label, tier_col in [
+        ('XGBoost',              'XGBoost_Tier'),
+        ('LightGBM',             'LightGBM_Tier'),
+        ('Average (Consensus)',  'Average_Tier'),
+    ]:
+        print(f"--- {model_label} Feature Tiers ---")
+        for tier in ['High', 'Moderate', 'Low']:
+            tier_features = feature_importance_df[feature_importance_df[tier_col] == tier]
+            imp_col = (
+                'XGBoost_Normalized'  if model_label == 'XGBoost'  else
+                'LightGBM_Normalized' if model_label == 'LightGBM' else
+                'Average_Importance'
+            )
+            print(f"\n  [{tier} Importance] - {len(tier_features)} feature(s):")
+            if len(tier_features) == 0:
+                print("    (none)")
+            else:
+                for _, row in tier_features.iterrows():
+                    print(f"    {row['Feature']:35s}  {imp_col.split('_')[0]} norm: {row[imp_col]:.6f}")
+        print()
+
+    # Save the tier-annotated importance table
+    timestamp_refine = datetime.now().strftime('%Y%m%d_%H%M%S')
+    tier_file = f'results_logs/feature_tiers_{timestamp_refine}.csv'
+    feature_importance_df.to_csv(tier_file, index=False)
+    print(f"Feature tier table saved to: {tier_file}\n")
+
+    # ------------------------------------------------------------------
+    # 3.  Build the refined feature list (drop Low consensus avg tier)
+    # ------------------------------------------------------------------
+    low_avg_features = feature_importance_df[
+        feature_importance_df['Average_Tier'] == 'Low'
+    ]['Feature'].tolist()
+
+    refined_features = [f for f in features if f not in low_avg_features]
+
+    print(f"Features removed (Low consensus average importance): {len(low_avg_features)}")
+    for f in low_avg_features:
+        row = feature_importance_df[feature_importance_df['Feature'] == f].iloc[0]
+        print(f"  - {f:35s}  avg: {row['Average_Importance']:.6f}  "
+              f"(XGB: {row['XGBoost_Normalized']:.6f} [{row['XGBoost_Tier']}]  "
+              f"LGB: {row['LightGBM_Normalized']:.6f} [{row['LightGBM_Tier']}])")
+
+    print(f"\nOriginal feature count : {len(features)}")
+    print(f"Refined  feature count : {len(refined_features)}")
+    print(f"Retained features      : {refined_features}\n")
+
+    # ------------------------------------------------------------------
+    # 4.  5-fold CV on refined feature set
+    # ------------------------------------------------------------------
+    x_refined = x_full[refined_features]
+
+    # --- XGBoost refined ---
+    print("Running 5-fold CV for XGBoost on refined features...")
+    xgb_refined = xgb.XGBRegressor(
+        n_estimators=best_xgb_trial.params['n_estimators'],
+        learning_rate=best_xgb_trial.params['learning_rate'],
+        max_depth=best_xgb_trial.params['max_depth'],
+        min_child_weight=best_xgb_trial.params['min_child_weight'],
+        subsample=best_xgb_trial.params['subsample'],
+        colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+        gamma=best_xgb_trial.params.get('gamma', 0),
+        reg_alpha=best_xgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_xgb_trial.params.get('reg_lambda', 1),
+        random_state=42,
+        n_jobs=12,
+        verbosity=0
+    )
+
+    xgb_ref_r2_scores   = cross_val_score(xgb_refined, x_refined, y_full, cv=cv5, scoring='r2')
+    xgb_ref_rmse_scores = np.sqrt(-cross_val_score(xgb_refined, x_refined, y_full, cv=cv5, scoring='neg_mean_squared_error'))
+    xgb_refined_r2   = xgb_ref_r2_scores.mean()
+    xgb_refined_rmse = xgb_ref_rmse_scores.mean()
+
+    print(f"XGBoost (refined) CV R²: {xgb_refined_r2:.6f}")
+    print(f"XGBoost (refined) CV RMSE : {xgb_refined_rmse:.4f}")
+
+    # --- LightGBM refined ---
+    print("Running 5-fold CV for LightGBM on refined features...")
+    lgb_refined = lgb.LGBMRegressor(
+        n_estimators=best_lgb_trial.params['n_estimators'],
+        learning_rate=best_lgb_trial.params['learning_rate'],
+        num_leaves=best_lgb_trial.params['num_leaves'],
+        min_child_samples=best_lgb_trial.params['min_child_samples'],
+        subsample=best_lgb_trial.params['subsample'],
+        feature_fraction=best_lgb_trial.params.get('feature_fraction', 1.0),
+        reg_alpha=best_lgb_trial.params.get('reg_alpha', 0),
+        reg_lambda=best_lgb_trial.params.get('reg_lambda', 1),
+        random_state=42,
+        n_jobs=12,
+        verbose=-1
+    )
+
+    lgb_ref_r2_scores   = cross_val_score(lgb_refined, x_refined, y_full, cv=cv5, scoring='r2')
+    lgb_ref_rmse_scores = np.sqrt(-cross_val_score(lgb_refined, x_refined, y_full, cv=cv5, scoring='neg_mean_squared_error'))
+    lgb_refined_r2   = lgb_ref_r2_scores.mean()
+    lgb_refined_rmse = lgb_ref_rmse_scores.mean()
+
+    print(f"LightGBM (refined) CV R²: {lgb_refined_r2:.6f}")
+    print(f"LightGBM (refined) CV RMSE: {lgb_refined_rmse:.4f}\n")
+
+    # ------------------------------------------------------------------
+    # 5.  Delta comparison: full feature set vs refined feature set
+    # ------------------------------------------------------------------
+    print("Refined vs Full - Performance Delta\n")
+
+    xgb_r2_delta   = xgb_refined_r2   - xgb_full_r2
+    xgb_rmse_delta = xgb_refined_rmse - xgb_full_rmse
+    lgb_r2_delta   = lgb_refined_r2   - lgb_full_r2
+    lgb_rmse_delta = lgb_refined_rmse - lgb_full_rmse
+
+    def _delta_str(val, higher_better=True):
+        sign   = '+' if val >= 0 else ''
+        better = (val > 0) if higher_better else (val < 0)
+        tag    = 'improved' if better else ('no change' if val == 0 else 'worse')
+        return f"{sign}{val:.6f}  ({tag})"
+
+    header = f"{'Metric':<26} {'Full Features (CV)':>22} {'Refined Features (CV)':>22} {'Delta':>30}"
+    print(header)
+    print('-' * len(header))
+    print(f"{'XGBoost  R²':<26} {xgb_full_r2:>22.6f} {xgb_refined_r2:>22.6f} {_delta_str(xgb_r2_delta, higher_better=True):>30}")
+    print(f"{'XGBoost  RMSE':<26} {xgb_full_rmse:>22.4f} {xgb_refined_rmse:>22.4f} {_delta_str(xgb_rmse_delta, higher_better=False):>30}")
+    print(f"{'LightGBM R²':<26} {lgb_full_r2:>22.6f} {lgb_refined_r2:>22.6f} {_delta_str(lgb_r2_delta, higher_better=True):>30}")
+    print(f"{'LightGBM RMSE':<26} {lgb_full_rmse:>22.4f} {lgb_refined_rmse:>22.4f} {_delta_str(lgb_rmse_delta, higher_better=False):>30}")
+    print()
+
+    avg_r2_full    = (xgb_full_r2    + lgb_full_r2)    / 2
+    avg_r2_refined = (xgb_refined_r2 + lgb_refined_r2) / 2
+    verdict = "REFINED feature set is better" if avg_r2_refined > avg_r2_full else "FULL feature set is better (or equal)"
+    print(f"Average CV R² (full):    {avg_r2_full:.6f}")
+    print(f"Average CV R² (refined): {avg_r2_refined:.6f}")
+    print(f"Verdict: {verdict}\n")
+
+    # ------------------------------------------------------------------
+    # 6.  Plot side-by-side bar chart: full vs refined per model
+    # ------------------------------------------------------------------
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    metrics     = ['CV R²', 'CV RMSE']
+    xgb_full_v  = [xgb_full_r2,    xgb_full_rmse]
+    xgb_refin_v = [xgb_refined_r2, xgb_refined_rmse]
+    lgb_full_v  = [lgb_full_r2,    lgb_full_rmse]
+    lgb_refin_v = [lgb_refined_r2, lgb_refined_rmse]
+
+    x_pos = np.arange(len(metrics))
+    bar_w = 0.35
+
+    for ax, full_v, refin_v, title, color_full, color_ref in [
+        (axes[0], xgb_full_v, xgb_refin_v, 'XGBoost',  '#FF6B6B', '#c0392b'),
+        (axes[1], lgb_full_v, lgb_refin_v, 'LightGBM', '#45B7D1', '#1a7a9e'),
+    ]:
+        bars1 = ax.bar(x_pos - bar_w/2, full_v,  bar_w, label='Full features',    color=color_full, alpha=0.85)
+        bars2 = ax.bar(x_pos + bar_w/2, refin_v, bar_w, label='Refined features', color=color_ref,  alpha=0.85)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(metrics, fontsize=11)
+        ax.set_title(f'{title}: Full vs Refined (5-Fold CV)', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(axis='y', alpha=0.3)
+
+        for bar in list(bars1) + list(bars2):
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, h * 1.01,
+                    f'{h:.4f}', ha='center', va='bottom', fontsize=8)
+
+    plt.suptitle('Full vs Refined Feature Set - 5-Fold CV Performance', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+
+    refine_plot_file = f'results_logs/feature_refine_comparison_{timestamp_refine}.png'
+    plt.savefig(refine_plot_file, dpi=300, bbox_inches='tight')
+    print(f"Refinement comparison plot saved to: {refine_plot_file}\n")
+    plt.show()
+
+    # ------------------------------------------------------------------
+    # 7.  Save refinement results to JSON
+    # ------------------------------------------------------------------
+    refine_results = {
+        'cv_folds': 5,
+        'removed_features':  low_avg_features,
+        'retained_features': refined_features,
+        'feature_counts': {
+            'original': len(features),
+            'refined':  len(refined_features),
+            'removed':  len(low_avg_features)
+        },
+        'full_feature_cv_results': {
+            'XGBoost': {
+                'r2_mean':   float(xgb_full_r2),
+                'r2_std':    float(xgb_cv_r2_scores.std()),
+                'rmse_mean': float(xgb_full_rmse),
+                'rmse_std':  float(xgb_cv_rmse_scores.std()),
+                'r2_folds':  xgb_cv_r2_scores.tolist(),
+                'rmse_folds':xgb_cv_rmse_scores.tolist(),
+            },
+            'LightGBM': {
+                'r2_mean':   float(lgb_full_r2),
+                'r2_std':    float(lgb_cv_r2_scores.std()),
+                'rmse_mean': float(lgb_full_rmse),
+                'rmse_std':  float(lgb_cv_rmse_scores.std()),
+                'r2_folds':  lgb_cv_r2_scores.tolist(),
+                'rmse_folds':lgb_cv_rmse_scores.tolist(),
+            },
+        },
+        'refined_feature_cv_results': {
+            'XGBoost': {
+                'r2_mean':   float(xgb_refined_r2),
+                'r2_std':    float(xgb_ref_r2_scores.std()),
+                'rmse_mean': float(xgb_refined_rmse),
+                'rmse_std':  float(xgb_ref_rmse_scores.std()),
+                'r2_folds':  xgb_ref_r2_scores.tolist(),
+                'rmse_folds':xgb_ref_rmse_scores.tolist(),
+            },
+            'LightGBM': {
+                'r2_mean':   float(lgb_refined_r2),
+                'r2_std':    float(lgb_ref_r2_scores.std()),
+                'rmse_mean': float(lgb_refined_rmse),
+                'rmse_std':  float(lgb_ref_rmse_scores.std()),
+                'r2_folds':  lgb_ref_r2_scores.tolist(),
+                'rmse_folds':lgb_ref_rmse_scores.tolist(),
+            },
+        },
+        'deltas': {
+            'XGBoost':  {'r2_delta': float(xgb_r2_delta),  'rmse_delta': float(xgb_rmse_delta)},
+            'LightGBM': {'r2_delta': float(lgb_r2_delta),  'rmse_delta': float(lgb_rmse_delta)},
+        },
+        'verdict':   verdict,
+        'timestamp': timestamp_refine
+    }
+
+    refine_json_file = f'results_logs/feature_refine_results_{timestamp_refine}.json'
+    with open(refine_json_file, 'w') as f:
+        json.dump(refine_results, f, indent=2)
+    print(f"Refinement results saved to: {refine_json_file}\n")
+
+    print("==============|Feature Refinement Complete|==============\n")
+
+
+if ENABLE_FINAL_TEST:
+    print("\n\nFINAL TRAINING SECTION - Best XGBoost Model on Full Training Data\n")
+
+    # Best Parameters during testing, as a backup
+    final_xgb_params = {
+        'n_estimators': 51,
+        'learning_rate': 0.10471209213501693,
+        'max_depth': 12,
+        'min_child_weight': 6,
+        'subsample': 0.9085081386743783,
+        'colsample_bytree': 0.6296178606936361,
+        'gamma': 1.7923286427213632,
+        'reg_alpha': 0.11586905952512971,
+        'reg_lambda': 8.631034258755935
+    }
+
+    # Try to load from JSON if it exists
+    xgb_params_file = 'results_logs/best_xgboost_params.json'
+    if os.path.exists(xgb_params_file):
+        try:
+            with open(xgb_params_file, 'r') as f:
+                loaded_data = json.load(f)
+                final_xgb_params = loaded_data.get('params', final_xgb_params)
+            print(f"Loaded XGBoost parameters from {xgb_params_file}\n")
+        except Exception as e:
+            print(f"Could not load parameters from {xgb_params_file}, using defaults: {e}\n")
+    else:
+        print(f"{xgb_params_file} not found, using default best parameters\n")
+
+    print(f"Final XGBoost Parameters:")
+    for param, value in final_xgb_params.items():
+        print(f"  {param}: {value}")
+    print()
+
+    # Step 2: Prepare full training data
+    print("Loading and preparing training data (100%)...")
+    df_final_train = pd.read_csv('Train.csv')
+    print(f"Training data shape: {df_final_train.shape}")
+    print(f"Training data columns: {list(df_final_train.columns)}\n")
+
+    taxi_final_train = setup_features(df_final_train, sample_fraction=1.0)
+    X_final_train = taxi_final_train[features]
+    y_final_train = taxi_final_train['duration']
+
+    print(f"Training features shape: {X_final_train.shape}")
+    print(f"Target shape: {y_final_train.shape}\n")
+
+    # Step 3: Train final XGBoost model on 100% training data
+    print("Training final XGBoost model on 100% of training data...")
+    final_xgb_model = xgb.XGBRegressor(
+        n_estimators=int(final_xgb_params['n_estimators']),
+        learning_rate=final_xgb_params['learning_rate'],
+        max_depth=int(final_xgb_params['max_depth']),
+        min_child_weight=int(final_xgb_params['min_child_weight']),
+        subsample=final_xgb_params['subsample'],
+        colsample_bytree=final_xgb_params['colsample_bytree'],
+        gamma=final_xgb_params['gamma'],
+        reg_alpha=final_xgb_params['reg_alpha'],
+        reg_lambda=final_xgb_params['reg_lambda'],
+        random_state=42,
+        n_jobs=12,
+        verbosity=0
+    )
+
+    final_xgb_model.fit(X_final_train, y_final_train)
+    print("Model training complete!\n")
+
+    # Step 4: Load and prepare test data
+    print("Loading test data from Gotham_Test_Set.csv...")
+    df_test = pd.read_csv('test_files/Gotham_Test_Set.csv')
+    print(f"Test data shape: {df_test.shape}")
+    print(f"Test data columns: {list(df_test.columns)}")
+    print(f"First row:\n{df_test.head(1)}\n")
+
+    # Check for formatting differences
+    print("Checking test data formatting...")
+    print(f"  - Number of rows: {len(df_test)}")
+    print(f"  - All required feature columns present: {all(col in df_test.columns for col in ['pickup_datetime', 'NumberOfPassengers', 'pickup_x', 'pickup_y', 'dropoff_x', 'dropoff_y'])}")
+    print(f"  - Duration column: {('duration' in df_test.columns)} (expected to be empty for test set)\n")
+
+    # Step 5: Apply same feature engineering to test data
+    print("Applying feature engineering to test data...")
+    taxi_test = setup_features(df_test, sample_fraction=1.0)
+    X_test = taxi_test[features]
+    print(f"Test features shape: {X_test.shape}\n")
+
+    # Step 6: Make predictions on test data
+    print("Making predictions on test data...")
+    y_test_pred = final_xgb_model.predict(X_test)
+    print(f"Predictions shape: {y_test_pred.shape}\n")
+
+    # Step 7: Create output dataframe with predictions
+    print("Creating output file with predictions...")
+    output_df = pd.DataFrame({
+        'pickup_datetime': df_test['pickup_datetime'],
+        'NumberOfPassengers': df_test['NumberOfPassengers'],
+        'pickup_x': df_test['pickup_x'],
+        'pickup_y': df_test['pickup_y'],
+        'dropoff_x': df_test['dropoff_x'],
+        'dropoff_y': df_test['dropoff_y'],
+        'duration': y_test_pred
+    })
+
+    # Save predictions to CSV
+    timestamp_final = datetime.now().strftime('%Y%m%d_%H%M%S')
+    predictions_file = f'results_logs/gotham_predictions_{timestamp_final}.csv'
+    output_df.to_csv(predictions_file, index=False)
+    print(f"Predictions saved to {predictions_file}\n")
+
+    # Step 8: Summary statistics
+    print("="*80)
+    print("FINAL TRAINING SUMMARY")
+    print("="*80)
+    print(f"\nTraining Data:")
+    print(f"  - Total samples: {len(df_final_train)}")
+    print(f"  - Total features: {len(features)}")
+    print(f"\nTest Data:")
+    print(f"  - Total samples: {len(df_test)}")
+    print(f"\nPredictions:")
+    print(f"  - Min predicted duration: {y_test_pred.min():.4f}")
+    print(f"  - Max predicted duration: {y_test_pred.max():.4f}")
+    print(f"  - Mean predicted duration: {y_test_pred.mean():.4f}")
+    print(f"  - Std predicted duration: {y_test_pred.std():.4f}")
+    print(f"\nOutput File: {predictions_file}")
+    print(f"  - Columns: {list(output_df.columns)}")
+    print(f"  - Shape: {output_df.shape}\n")
+
+    print("="*80)
+    print("FINAL TRAINING COMPLETE")
+    print("="*80 + "\n")
