@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from datetime import date, datetime, timedelta
+import json
+import os
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet, LassoCV
 from sklearn.ensemble import RandomForestRegressor, BaggingRegressor
 from sklearn.tree import DecisionTreeRegressor
@@ -47,6 +49,11 @@ ENABLE_ADABOOST = False
 ENABLE_XGBOOST = False
 ENABLE_CATBOOST = False
 ENABLE_LIGHTGBM = False
+
+# Advanced sections
+ENABLE_CV_CURVES = False
+ENABLE_FULL_TRAINING = True
+ENABLE_FEATURE_SELECTION = False  # Set to True to use only top 30 features
 # ============================================
 
 def parseDateTime(dateString):
@@ -166,12 +173,16 @@ def isHoliday(start_month, start_day, start_year):
     
     return int((month, day) in holidays_2034)
 
-def setup_features(df):
+def setup_features(df, sample_fraction=None):
+    """Setup features for the dataset. If sample_fraction is None, uses global sample_frac"""
+    if sample_fraction is None:
+        sample_fraction = sample_frac
+        
 # Read Data
-    taxi = df.sample(frac=sample_frac, random_state=42).copy()
+    taxi = df.sample(frac=sample_fraction, random_state=42).copy()
 
     print('==============|Training Data Imported|==============')
-    print(f'Using {sample_frac*100}% of training data ({len(taxi)} rows out of {len(df)} total rows)\n')
+    print(f'Using {sample_fraction*100}% of training data ({len(taxi)} rows out of {len(df)} total rows)\n')
 
     # Starting values
     taxi['start_hour'] = taxi['pickup_datetime'].apply(getStartHour)
@@ -198,6 +209,7 @@ def setup_features(df):
     taxi['manhattan_distance_squared'] = taxi['manhattan_distance'] ** 2
     taxi['euclidean_distance'] = np.sqrt(taxi['x2xDistance'] ** 2 + taxi['y2yDistance'] ** 2)
     taxi['euclidean_distance_squared'] = taxi['euclidean_distance'] ** 2
+    taxi['euclidean_distance_cubed'] = taxi['euclidean_distance'] ** 3
     taxi['distance_category'] = pd.cut(taxi['euclidean_distance'], bins=[0, 1, 2, 5, 10, float('inf')], labels=['very_short', 'short', 'medium', 'long', 'very_long']).cat.codes
 
         # Relating distances to potentially related metrics
@@ -206,9 +218,11 @@ def setup_features(df):
     taxi['distance_x_weekend'] = taxi['x2xDistance'] * taxi['is_weekend']
     taxi['distance_y_weekend'] = taxi['y2yDistance'] * taxi['is_weekend']
     taxi['distance_x_hour'] = taxi['x2xDistance'] * taxi['start_hour']
+    taxi['distance_x_hour_squared'] = taxi['distance_x_hour'] ** 2
     taxi['distance_y_hour'] = taxi['y2yDistance'] * taxi['start_hour']
     taxi['distance_x_dest_x'] = taxi['x2xDistance'] * taxi['dropoff_x']
     taxi['distance_y_dest_y'] = taxi['y2yDistance'] * taxi['dropoff_y']
+    taxi['distance_x_passengers'] = taxi['euclidean_distance'] * taxi['NumberOfPassengers']
 
         # Adding non-linearity
     taxi['x2xDistance_squared'] = taxi['x2xDistance'] ** 2
@@ -230,6 +244,7 @@ def setup_features(df):
     taxi['is_rush_hour'] = (((taxi['start_hour'] >= 8) & (taxi['start_hour'] <= 10)) | ((taxi['start_hour'] >= 17) & (taxi['start_hour'] <= 19))).astype(int)
 
     # Passenger values
+    taxi['passengers_x_weekend'] = taxi['NumberOfPassengers'] * taxi['is_weekend']
     taxi['solo_passenger'] = (taxi['NumberOfPassengers'] == 1).astype(int)
     taxi['many_passengers'] = (taxi['NumberOfPassengers'] > 3).astype(int)
 
@@ -248,20 +263,29 @@ def setup_features(df):
 
 # ============== Linear Regression ==============
 features = [
-    'start_hour', 'start_minute', 'start_day', 'start_month', 
-    'x2xDistance', 'dayOfWeek', 
-    'additionalStop', 'is_weekend', 
-    'x2xDistance_squared', 'y2yDistance_squared', 
-    'x2xDistance_cubed', 'y2yDistance_cubed',
-    'distance_x_timeOfDay', 'distance_y_timeOfDay', 
-    'distance_x_weekend', 'distance_y_weekend',
-    'distance_x_hour', 'distance_y_hour',
-    'hour_sin', 'hour_cos', 'month_sin', 
-    'dayOfWeek_sin', 'dayOfWeek_cos',
-    'manhattan_distance_squared', 'euclidean_distance',
+    'start_hour', 'start_minute', 'start_day', 'start_month',
+    'dayOfWeek', 'timeOfDay', 'season',
+    'is_weekend', 'is_rush_hour', 'is_night', 'is_holiday',
+    'x2xDistance', 'y2yDistance',
+    'manhattan_distance', 'euclidean_distance',
+    'manhattan_distance_squared', 'euclidean_distance_squared',
+    'euclidean_distance_cubed',
     'distance_category',
-    'distance_x_dest_x', 'distance_y_dest_y',
-    'hour_x_is_weekend', 'timeOfDay_x_season'
+    'NumberOfPassengers', 'additionalStop',
+    'solo_passenger', 'many_passengers',
+    'distance_x_hour', 'distance_x_hour_squared',
+    'distance_x_timeOfDay', 'distance_x_weekend',
+    'distance_x_passengers',
+    'passengers_x_weekend',
+    'hour_x_is_weekend',
+    'hour_sin', 'hour_cos',
+    'month_sin', 'month_cos',
+    'dayOfWeek_sin', 'dayOfWeek_cos',
+    'minutes_since_midnight', 'minutes_until_midnight',
+    'pickup_quadrant_x', 'pickup_quadrant_y',
+    'dropoff_quadrant_x', 'dropoff_quadrant_y',
+    'cross_quadrant_trip',
+    'pickup_x', 'pickup_y', 'dropoff_x', 'dropoff_y'
 ]
 
 print('==============|Preparing Data|==============')
@@ -277,6 +301,39 @@ y = taxi['duration']
 
 print('==============|Data Ready|==============')
 
+# Feature selection phase: Use top 30 features if requested
+selected_features = features  # Default to all features
+top_30_features = None
+
+if ENABLE_FEATURE_SELECTION or ENABLE_LINEAR_REGRESSION:
+    print('\n==============|Feature Selection Phase|==============\n')
+    
+    # Train quick linear regression to identify top features
+    print("Identifying top features using linear regression...")
+    linear_selector = LinearRegression()
+    linear_selector.fit(x, y)
+    
+    # Get feature importances (absolute coefficients)
+    feature_importance = np.abs(linear_selector.coef_)
+    
+    # Create DataFrame with features and their importance
+    importance_df = pd.DataFrame({
+        'Feature': features,
+        'Coefficient': linear_selector.coef_,
+        'Abs_Coefficient': feature_importance
+    }).sort_values('Abs_Coefficient', ascending=False)
+    
+    # Select top 30 features
+    top_30_features = importance_df.head(30)['Feature'].tolist()
+    top_30_indices = [features.index(f) for f in top_30_features]
+    
+    print(f"\n==============|Top 30 Most Important Features|==============\n")
+    print(importance_df.head(30)[['Feature', 'Coefficient', 'Abs_Coefficient']].to_string(index=False))
+    
+    selected_features = top_30_features
+    x = x[:, top_30_indices]
+    print(f"\n*** Using TOP 30 FEATURES for all model evaluations ***\n")
+
 if ENABLE_LINEAR_REGRESSION:
     print('==============|Linear Regression|==============')
     
@@ -285,7 +342,7 @@ if ENABLE_LINEAR_REGRESSION:
     linear_cv_scores = cross_val_score(linear_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
 
     print(f"Linear Mean CV R²: {linear_cv_scores.mean():.6f}")
-    print(f"Linear Std Dev CV R²: {linear_cv_scores.std():.6f}")
+    print(f"Linear Std Dev CV R²: {linear_cv_scores.std():.6f}\n")
 
 if ENABLE_RIDGE_REGRESSION:
     print('==============|Ridge Regression|==============')
@@ -451,7 +508,7 @@ if ENABLE_NEURAL_NETWORK:
     # Optuna optimization
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(nn_objective, n_trials=15, show_progress_bar=True)
+    study.optimize(nn_objective, n_trials=3, show_progress_bar=True)
     
     best_nn_trial = study.best_trial
     best_hidden_layers = [best_nn_trial.params[f'hidden_size_{i}'] 
@@ -860,150 +917,319 @@ best_lgb_trial = BestTrialMock({
 })
 
 # Cross Validation Curves of top 4 R^2 models
-print('==============|Cross-Validation Curves: Depth Analysis|==============\n')
+if ENABLE_CV_CURVES:
+    print('==============|Cross-Validation Curves: Depth Analysis|==============\n')
 
-import matplotlib.pyplot as plt
-import json
-import os
-from datetime import datetime
+    import matplotlib.pyplot as plt
+    from datetime import datetime
 
-# Define depth range
-depths = list(range(1, 15))  # 2 to 17 inclusive
+    # Define depth range
+    depths = list(range(1, 15))  # 2 to 17 inclusive
 
-# Checkpoint file for resuming work
-checkpoint_file = 'results_logs/cv_curves_checkpoint.json'
+    # Checkpoint file for resuming work
+    checkpoint_file = 'results_logs/cv_curves_checkpoint.json'
 
-# Load checkpoint if it exists
-checkpoint_data = {}
-if os.path.exists(checkpoint_file):
-    with open(checkpoint_file, 'r') as f:
-        checkpoint_data = json.load(f)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded checkpoint from {checkpoint_file}\n")
+    # Load checkpoint if it exists
+    checkpoint_data = {}
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, 'r') as f:
+            checkpoint_data = json.load(f)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded checkpoint from {checkpoint_file}\n")
 
-# Store CV scores for each model
-xgb_depths_scores = checkpoint_data.get('xgb_depths_scores', [])
-catboost_depths_scores = checkpoint_data.get('catboost_depths_scores', [])
-lightgbm_depths_scores = checkpoint_data.get('lightgbm_depths_scores', [])
-gb_depths_scores = checkpoint_data.get('gb_depths_scores', [])
+    # Store CV scores for each model
+    xgb_depths_scores = checkpoint_data.get('xgb_depths_scores', [])
+    catboost_depths_scores = checkpoint_data.get('catboost_depths_scores', [])
+    lightgbm_depths_scores = checkpoint_data.get('lightgbm_depths_scores', [])
+    gb_depths_scores = checkpoint_data.get('gb_depths_scores', [])
 
-# XGBoost across depths
-if len(xgb_depths_scores) == 0:
-    print("XGBoost: ")
-    for depth in depths:
-        xgb_model = xgb.XGBRegressor(
-            n_estimators=best_xgb_trial.params['n_estimators'],
-            learning_rate=best_xgb_trial.params['learning_rate'],
-            max_depth=depth,
-            min_child_weight=best_xgb_trial.params['min_child_weight'],
-            subsample=best_xgb_trial.params['subsample'],
-            colsample_bytree=best_xgb_trial.params['colsample_bytree'],
-            random_state=42,
-            n_jobs=12,
-            verbosity=0
-        )
-        cv_scores = cross_val_score(xgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
-        mean_score = cv_scores.mean()
-        xgb_depths_scores.append(mean_score)
-        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
-    print(" Done")
-    checkpoint_data['xgb_depths_scores'] = xgb_depths_scores
-else:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded XGBoost results from checkpoint ({len(xgb_depths_scores)} depths)")
+    # XGBoost across depths
+    if len(xgb_depths_scores) == 0:
+        print("XGBoost: ")
+        for depth in depths:
+            xgb_model = xgb.XGBRegressor(
+                n_estimators=best_xgb_trial.params['n_estimators'],
+                learning_rate=best_xgb_trial.params['learning_rate'],
+                max_depth=depth,
+                min_child_weight=best_xgb_trial.params['min_child_weight'],
+                subsample=best_xgb_trial.params['subsample'],
+                colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+                random_state=42,
+                n_jobs=12,
+                verbosity=0
+            )
+            cv_scores = cross_val_score(xgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
+            mean_score = cv_scores.mean()
+            xgb_depths_scores.append(mean_score)
+            print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+        print(" Done")
+        checkpoint_data['xgb_depths_scores'] = xgb_depths_scores
+    else:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded XGBoost results from checkpoint ({len(xgb_depths_scores)} depths)")
+    # CatBoost across depths
+    if len(catboost_depths_scores) == 0:
+        print("CatBoost: ")
+        for depth in depths:
+            cb_model = __import__('catboost', fromlist=['CatBoostRegressor']).CatBoostRegressor(
+                iterations=best_cb_trial.params['iterations'],
+                learning_rate=best_cb_trial.params['learning_rate'],
+                depth=depth,
+                l2_leaf_reg=best_cb_trial.params['l2_leaf_reg'],
+                random_state=42,
+                verbose=False
+            )
+            cv_scores = cross_val_score(cb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+            mean_score = cv_scores.mean()
+            catboost_depths_scores.append(mean_score)
+            print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+        print(" Done")
+        checkpoint_data['catboost_depths_scores'] = catboost_depths_scores
+    else:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded CatBoost results from checkpoint ({len(catboost_depths_scores)} depths)")
 
-# CatBoost across depths
-if len(catboost_depths_scores) == 0:
-    print("CatBoost: ")
-    for depth in depths:
-        cb_model = __import__('catboost', fromlist=['CatBoostRegressor']).CatBoostRegressor(
-            iterations=best_cb_trial.params['iterations'],
-            learning_rate=best_cb_trial.params['learning_rate'],
-            depth=depth,
-            l2_leaf_reg=best_cb_trial.params['l2_leaf_reg'],
-            random_state=42,
-            verbose=False
-        )
-        cv_scores = cross_val_score(cb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-        mean_score = cv_scores.mean()
-        catboost_depths_scores.append(mean_score)
-        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
-    print(" Done")
-    checkpoint_data['catboost_depths_scores'] = catboost_depths_scores
-else:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded CatBoost results from checkpoint ({len(catboost_depths_scores)} depths)")
+    # LightGBM across depths
+    if len(lightgbm_depths_scores) == 0:
+        print("LightGBM: ")
+        for depth in depths:
+            lgb_model = lgb.LGBMRegressor(
+                n_estimators=best_lgb_trial.params['n_estimators'],
+                learning_rate=best_lgb_trial.params['learning_rate'],
+                num_leaves=2**depth,  # LightGBM uses num_leaves instead of max_depth
+                min_child_samples=best_lgb_trial.params['min_child_samples'],
+                subsample=best_lgb_trial.params['subsample'],
+                random_state=42,
+                n_jobs=12,
+                verbose=-1
+            )
+            cv_scores = cross_val_score(lgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
+            mean_score = cv_scores.mean()
+            lightgbm_depths_scores.append(mean_score)
+            print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+        print(" Done")
+        checkpoint_data['lightgbm_depths_scores'] = lightgbm_depths_scores
+    else:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded LightGBM results from checkpoint ({len(lightgbm_depths_scores)} depths)")
 
-# LightGBM across depths
-if len(lightgbm_depths_scores) == 0:
-    print("LightGBM: ")
-    for depth in depths:
-        lgb_model = lgb.LGBMRegressor(
-            n_estimators=best_lgb_trial.params['n_estimators'],
-            learning_rate=best_lgb_trial.params['learning_rate'],
-            num_leaves=2**depth,  # LightGBM uses num_leaves instead of max_depth
-            min_child_samples=best_lgb_trial.params['min_child_samples'],
-            subsample=best_lgb_trial.params['subsample'],
-            random_state=42,
-            n_jobs=12,
-            verbose=-1
-        )
-        cv_scores = cross_val_score(lgb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2', n_jobs=12)
-        mean_score = cv_scores.mean()
-        lightgbm_depths_scores.append(mean_score)
-        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
-    print(" Done")
-    checkpoint_data['lightgbm_depths_scores'] = lightgbm_depths_scores
-else:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded LightGBM results from checkpoint ({len(lightgbm_depths_scores)} depths)")
+    # Gradient Boosting across depths (LIMITED TO 3 DEPTHS)
+    gb_depths_limited = [1, 2, 3]
+    if len(gb_depths_scores) == 0:
+        print("Gradient Boosting (LIMITED to 3 depths): ")
+        for depth in gb_depths_limited:
+            gb_model = GradientBoostingRegressor(
+                n_estimators=best_gb_trial.params['n_estimators'],
+                learning_rate=best_gb_trial.params['learning_rate'],
+                max_depth=depth,
+                min_samples_split=best_gb_trial.params['min_samples_split'],
+                min_samples_leaf=best_gb_trial.params['min_samples_leaf'],
+                subsample=best_gb_trial.params['subsample'],
+                random_state=42
+            )
+            cv_scores = cross_val_score(gb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
+            mean_score = cv_scores.mean()
+            gb_depths_scores.append(mean_score)
+            print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
+        print(" Done")
+        checkpoint_data['gb_depths_scores'] = gb_depths_scores
+    else:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded Gradient Boosting results from checkpoint ({len(gb_depths_scores)} depths)")
 
-# Gradient Boosting across depths (LIMITED TO 3 DEPTHS)
-gb_depths_limited = [1, 2, 3]
-if len(gb_depths_scores) == 0:
-    print("Gradient Boosting (LIMITED to 3 depths): ")
-    for depth in gb_depths_limited:
-        gb_model = GradientBoostingRegressor(
-            n_estimators=best_gb_trial.params['n_estimators'],
-            learning_rate=best_gb_trial.params['learning_rate'],
-            max_depth=depth,
-            min_samples_split=best_gb_trial.params['min_samples_split'],
-            min_samples_leaf=best_gb_trial.params['min_samples_leaf'],
-            subsample=best_gb_trial.params['subsample'],
-            random_state=42
-        )
-        cv_scores = cross_val_score(gb_model, x, y, cv=KFold(n_splits=5, shuffle=True, random_state=42), scoring='r2')
-        mean_score = cv_scores.mean()
-        gb_depths_scores.append(mean_score)
-        print(f"  Depth {depth:2d}: R² = {mean_score:.6f}")
-    print(" Done")
-    checkpoint_data['gb_depths_scores'] = gb_depths_scores
-else:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded Gradient Boosting results from checkpoint ({len(gb_depths_scores)} depths)")
+    # Save checkpoint after all models complete
+    with open(checkpoint_file, 'w') as f:
+        json.dump(checkpoint_data, f, indent=2)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checkpoint saved to {checkpoint_file}\n")
 
-# Save checkpoint after all models complete
-with open(checkpoint_file, 'w') as f:
-    json.dump(checkpoint_data, f, indent=2)
-print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checkpoint saved to {checkpoint_file}\n")
+    # Plot the curves
+    plt.figure(figsize=(12, 7))
+    plt.plot(depths, xgb_depths_scores, marker='o', linewidth=2.5, label='XGBoost', color='#FF6B6B', markersize=6)
+    plt.plot(depths, catboost_depths_scores, marker='s', linewidth=2.5, label='CatBoost', color='#4ECDC4', markersize=6)
+    plt.plot(depths, lightgbm_depths_scores, marker='^', linewidth=2.5, label='LightGBM', color='#45B7D1', markersize=6)
+    plt.plot(gb_depths_limited, gb_depths_scores, marker='D', linewidth=2.5, label='Gradient Boosting (3 depths)', color='#F7DC6F', markersize=6)
 
-# Plot the curves
-plt.figure(figsize=(12, 7))
-plt.plot(depths, xgb_depths_scores, marker='o', linewidth=2.5, label='XGBoost', color='#FF6B6B', markersize=6)
-plt.plot(depths, catboost_depths_scores, marker='s', linewidth=2.5, label='CatBoost', color='#4ECDC4', markersize=6)
-plt.plot(depths, lightgbm_depths_scores, marker='^', linewidth=2.5, label='LightGBM', color='#45B7D1', markersize=6)
-plt.plot(gb_depths_limited, gb_depths_scores, marker='D', linewidth=2.5, label='Gradient Boosting (3 depths)', color='#F7DC6F', markersize=6)
+    plt.xlabel('Max Depth', fontsize=12, fontweight='bold')
+    plt.ylabel('Mean CV R² Score (5-Fold)', fontsize=12, fontweight='bold')
+    plt.title('Cross-Validation Curves: Boosting Models Across Depth Parameters', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11, loc='best')
+    plt.grid(True, alpha=0.3, linestyle='--')
+    plt.xticks(depths)
+    plt.tight_layout()
+    plt.savefig('results_logs/cv_curves_depth_comparison.png', dpi=300, bbox_inches='tight')
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Plot saved to results_logs/cv_curves_depth_comparison.png")
+    plt.show()
 
-plt.xlabel('Max Depth', fontsize=12, fontweight='bold')
-plt.ylabel('Mean CV R² Score (5-Fold)', fontsize=12, fontweight='bold')
-plt.title('Cross-Validation Curves: Boosting Models Across Depth Parameters', fontsize=14, fontweight='bold')
-plt.legend(fontsize=11, loc='best')
-plt.grid(True, alpha=0.3, linestyle='--')
-plt.xticks(depths)
-plt.tight_layout()
-plt.savefig('results_logs/cv_curves_depth_comparison.png', dpi=300, bbox_inches='tight')
-print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Plot saved to results_logs/cv_curves_depth_comparison.png")
-plt.show()
+    print("\n==============|Depth Analysis Summary|==============")
+    print(f"XGBoost Best Depth: {depths[np.argmax(xgb_depths_scores)]} with R²: {max(xgb_depths_scores):.6f}")
+    print(f"CatBoost Best Depth: {depths[np.argmax(catboost_depths_scores)]} with R²: {max(catboost_depths_scores):.6f}")
+    print(f"LightGBM Best Depth: {depths[np.argmax(lightgbm_depths_scores)]} with R²: {max(lightgbm_depths_scores):.6f}")
+    print(f"Gradient Boosting Best Depth: {gb_depths_limited[np.argmax(gb_depths_scores)]} with R²: {max(gb_depths_scores):.6f}")
 
-# Print summary statistics
-print("\n==============|Depth Analysis Summary|==============")
-print(f"XGBoost Best Depth: {depths[np.argmax(xgb_depths_scores)]} with R²: {max(xgb_depths_scores):.6f}")
-print(f"CatBoost Best Depth: {depths[np.argmax(catboost_depths_scores)]} with R²: {max(catboost_depths_scores):.6f}")
-print(f"LightGBM Best Depth: {depths[np.argmax(lightgbm_depths_scores)]} with R²: {max(lightgbm_depths_scores):.6f}")
-print(f"Gradient Boosting Best Depth: {gb_depths_limited[np.argmax(gb_depths_scores)]} with R²: {max(gb_depths_scores):.6f}")
+if ENABLE_FULL_TRAINING:
+    print("\n\n==============|Full 100% Data Training with Feature Selection|==============\n")
+    
+    # Reload full dataset with all features
+    df_full = pd.read_csv('Train.csv')
+    taxi_full = setup_features(df_full, sample_fraction=1.0)
+    x_full_raw = taxi_full[features]
+    # scaler_full = StandardScaler()
+    x_full = x_full_raw #scaler_full.fit_transform(x_full_raw)
+    y_full = taxi_full['duration']
+    
+    # Train XGBoost on full data
+    print("Training XGBoost on 100% data...")
+    xgb_full = xgb.XGBRegressor(
+        n_estimators=best_xgb_trial.params['n_estimators'],
+        learning_rate=best_xgb_trial.params['learning_rate'],
+        max_depth=best_xgb_trial.params['max_depth'],
+        min_child_weight=best_xgb_trial.params['min_child_weight'],
+        subsample=best_xgb_trial.params['subsample'],
+        colsample_bytree=best_xgb_trial.params['colsample_bytree'],
+        random_state=42,
+        n_jobs=12,
+        verbosity=0
+    )
+    xgb_full.fit(x_full, y_full)
+    xgb_full_pred = xgb_full.predict(x_full)
+    xgb_full_r2 = r2_score(y_full, xgb_full_pred)
+    print(f"XGBoost R² on full data: {xgb_full_r2:.6f}\n")
+    
+    # Train LightGBM on full data
+    print("Training LightGBM on 100% data...")
+    lgb_full = lgb.LGBMRegressor(
+        n_estimators=best_lgb_trial.params['n_estimators'],
+        learning_rate=best_lgb_trial.params['learning_rate'],
+        num_leaves=best_lgb_trial.params['num_leaves'],
+        min_child_samples=best_lgb_trial.params['min_child_samples'],
+        subsample=best_lgb_trial.params['subsample'],
+        random_state=42,
+        n_jobs=12,
+        verbose=-1
+    )
+    lgb_full.fit(x_full, y_full)
+    lgb_full_pred = lgb_full.predict(x_full)
+    lgb_full_r2 = r2_score(y_full, lgb_full_pred)
+    print(f"LightGBM R² on full data: {lgb_full_r2:.6f}\n")
+    
+    # Extract feature importances (built-in to models)
+    print("==============|Feature Importance Analysis|==============\n")
+    
+    xgb_importance = xgb_full.feature_importances_
+    lgb_importance = lgb_full.feature_importances_
+    
+    # Create DataFrames for feature importance
+    feature_importance_df = pd.DataFrame({
+        'Feature': features,
+        'XGBoost_Importance': xgb_importance,
+        'LightGBM_Importance': lgb_importance,
+    })
+    
+    # Normalize importances to 0-1 scale for easier comparison
+    xgb_norm = xgb_importance / np.sum(xgb_importance)
+    lgb_norm = lgb_importance / np.sum(lgb_importance)
+    
+    feature_importance_df['XGBoost_Normalized'] = xgb_norm
+    feature_importance_df['LightGBM_Normalized'] = lgb_norm
+    feature_importance_df['Average_Importance'] = (xgb_norm + lgb_norm) / 2
+    
+    # Sort by average importance
+    feature_importance_df = feature_importance_df.sort_values('Average_Importance', ascending=False)
+    
+    # Display ALL features ranked by importance
+    print("ALL Features Ranked by Average Importance:\n")
+    print(feature_importance_df[['Feature', 'XGBoost_Normalized', 'LightGBM_Normalized', 'Average_Importance']].to_string(index=False))
+    print()
+    
+    # Save feature importance to CSV
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    importance_file = f'results_logs/feature_importance_full_training_{timestamp}.csv'
+    feature_importance_df.to_csv(importance_file, index=False)
+    print(f"\nFull feature importance saved to: {importance_file}")
+    
+    # Save model hyperparameters
+    hyperparams_file = f'results_logs/final_hyperparameters_full_training_{timestamp}.json'
+    hyperparams = {
+        'XGBoost': {
+            'n_estimators': best_xgb_trial.params['n_estimators'],
+            'learning_rate': best_xgb_trial.params['learning_rate'],
+            'max_depth': best_xgb_trial.params['max_depth'],
+            'min_child_weight': best_xgb_trial.params['min_child_weight'],
+            'subsample': best_xgb_trial.params['subsample'],
+            'colsample_bytree': best_xgb_trial.params['colsample_bytree'],
+            'r2_score': float(xgb_full_r2)
+        },
+        'LightGBM': {
+            'n_estimators': best_lgb_trial.params['n_estimators'],
+            'learning_rate': best_lgb_trial.params['learning_rate'],
+            'num_leaves': best_lgb_trial.params['num_leaves'],
+            'min_child_samples': best_lgb_trial.params['min_child_samples'],
+            'subsample': best_lgb_trial.params['subsample'],
+            'r2_score': float(lgb_full_r2)
+        },
+        'training_info': {
+            'total_samples': len(taxi_full),
+            'total_features': len(features),
+            'timestamp': timestamp
+        }
+    }
+    
+    with open(hyperparams_file, 'w') as f:
+        json.dump(hyperparams, f, indent=2)
+    print(f"Hyperparameters saved to: {hyperparams_file}\n")
+    
+    # Plot feature importance comparison - ALL features
+    import matplotlib.pyplot as plt
+    
+    all_features_df = feature_importance_df
+    
+    fig, axes = plt.subplots(1, 2, figsize=(18, max(10, len(all_features_df) * 0.25)))
+    
+    # XGBoost importance
+    axes[0].barh(range(len(all_features_df)), all_features_df['XGBoost_Normalized'], color='#FF6B6B')
+    axes[0].set_yticks(range(len(all_features_df)))
+    axes[0].set_yticklabels(all_features_df['Feature'], fontsize=9)
+    axes[0].set_xlabel('Normalized Importance', fontsize=11, fontweight='bold')
+    axes[0].set_title(f'XGBoost Feature Importance (All {len(all_features_df)} Features)', fontsize=12, fontweight='bold')
+    axes[0].invert_yaxis()
+    axes[0].grid(axis='x', alpha=0.3)
+    
+    # LightGBM importance
+    axes[1].barh(range(len(all_features_df)), all_features_df['LightGBM_Normalized'], color='#45B7D1')
+    axes[1].set_yticks(range(len(all_features_df)))
+    axes[1].set_yticklabels(all_features_df['Feature'], fontsize=9)
+    axes[1].set_xlabel('Normalized Importance', fontsize=11, fontweight='bold')
+    axes[1].set_title(f'LightGBM Feature Importance (All {len(all_features_df)} Features)', fontsize=12, fontweight='bold')
+    axes[1].invert_yaxis()
+    axes[1].grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    
+    plot_file = f'results_logs/feature_importance_comparison_ALL_{timestamp}.png'
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    print(f"Feature importance plot (ALL features) saved to: {plot_file}\n")
+    plt.show()
+    
+    # Summary statistics
+    print("==============|Feature Selection Summary|==============")
+    print(f"\nXGBoost Model R²: {xgb_full_r2:.6f}")
+    print(f"LightGBM Model R²: {lgb_full_r2:.6f}")
+    print(f"Better Model: {'XGBoost' if xgb_full_r2 > lgb_full_r2 else 'LightGBM'} ({max(xgb_full_r2, lgb_full_r2):.6f})")
+    print(f"\nTotal Features Analyzed: {len(features)}")
+    print(f"Top 5 Consensus Features (by average importance):")
+    for i, row in feature_importance_df.head(5).iterrows():
+        print(f"  {i+1}. {row['Feature']:30s} - Avg Importance: {row['Average_Importance']:.6f}")
+    
+    # Feature removal analysis
+    print("\n==============|Feature Removal Analysis|==============")
+    
+    # Define importance thresholds
+    thresholds = [0.005, 0.01, 0.02, 0.05]
+    
+    print("\nFeatures that could be removed (by importance threshold):")
+    for threshold in thresholds:
+        removable = feature_importance_df[feature_importance_df['Average_Importance'] <= threshold]
+        print(f"\n  Below {threshold*100:.1f}% avg importance: {len(removable)} features")
+        if len(removable) > 0:
+            for idx, row in removable.iterrows():
+                print(f"    - {row['Feature']:30s} : {row['Average_Importance']:.6f}")
+    
+    print(f"\nNumber of highly important features (>1% avg importance): {len(feature_importance_df[feature_importance_df['Average_Importance'] > 0.01])}")
+    print(f"Number of moderately important features (0.5%-1% avg importance): {len(feature_importance_df[(feature_importance_df['Average_Importance'] > 0.005) & (feature_importance_df['Average_Importance'] <= 0.01)])}")
+    print(f"Number of low importance features (<0.5% avg importance): {len(feature_importance_df[feature_importance_df['Average_Importance'] <= 0.005])}")
 
