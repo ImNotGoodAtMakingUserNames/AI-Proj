@@ -20,14 +20,24 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 # ============== FEATURE ENGINEERING ==============
 
 def parseDateTime(dateString):
-    """Parse datetime string and return datetime object"""
+    """Parse datetime string and return datetime object
+    Handles both formats:
+    - Training: '2034-03-07 08:18:00'
+    - Test: '3/7/34 8:18'
+    """
     if pd.isna(dateString):
         raise ValueError(f"dateString is NaN")
     try:
         s = str(dateString).strip()
         if ',' in s:
             s = s.split(',', 1)[0].strip()
-        return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+        
+        # Try training format first
+        try:
+            return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            # Try test format: M/D/YY H:MM
+            return datetime.strptime(s, '%m/%d/%y %H:%M')
     except Exception as e:
         raise ValueError(f"Failed to parse datetime string '{dateString}': {e}")
 
@@ -136,8 +146,14 @@ def isHoliday(start_month, start_day, start_year):
     
     return int((month, day) in holidays_2034)
 
-def engineer_features(df):
-    """Enhanced feature engineering"""
+def engineer_features(df, include_duration_features=True):
+    """Enhanced feature engineering
+    
+    Args:
+        df: Input dataframe
+        include_duration_features: If False, skips features that depend on duration
+                                   (for test data prediction)
+    """
     taxi = df.copy()
     
     # Extract datetime components
@@ -158,14 +174,16 @@ def engineer_features(df):
     
     taxi['season'] = taxi['start_month'].apply(getSeason)
     
-    taxi['end_time'] = taxi.apply(
-        lambda row: getEndTime(row['start_hour'], row['start_minute'], row['start_second'],
-                              row['start_day'], row['start_month'], row['start_year'], row['duration']), axis=1
-    )
-    
-    taxi['end_hour'] = taxi['end_time'].apply(getEndHour)
-    taxi['end_minute'] = taxi['end_time'].apply(getEndMinute)
-    taxi['end_second'] = taxi['end_time'].apply(getEndSecond)
+    # Only compute end_time and related features if duration is available
+    if include_duration_features and 'duration' in taxi.columns:
+        taxi['end_time'] = taxi.apply(
+            lambda row: getEndTime(row['start_hour'], row['start_minute'], row['start_second'],
+                                  row['start_day'], row['start_month'], row['start_year'], row['duration']), axis=1
+        )
+        
+        taxi['end_hour'] = taxi['end_time'].apply(getEndHour)
+        taxi['end_minute'] = taxi['end_time'].apply(getEndMinute)
+        taxi['end_second'] = taxi['end_time'].apply(getEndSecond)
     
     taxi['timeOfDay'] = taxi['start_hour'].apply(getTimeofDay)
     taxi['is_weekend'] = taxi['dayOfWeek'].apply(isWeekend)
@@ -264,11 +282,11 @@ if __name__ == "__main__":
     print("Applying feature engineering...")
     taxi = engineer_features(df)
     
-    # Selected features from Pass 2 (20 features)
+    # Selected features from Pass 2 (18 features - removed end_hour and end_minute to prevent data leakage)
     selected_features = [
         'euclidean_distance', 'manhattan_distance', 'euclidean_distance_squared',
-        'hour_cos', 'dayOfWeek', 'end_hour', 'cross_quadrant_trip', 'dayOfWeek_cos',
-        'end_minute', 'minutes_until_midnight', 'start_minute', 'distance_category',
+        'hour_cos', 'dayOfWeek', 'cross_quadrant_trip', 'dayOfWeek_cos',
+        'minutes_until_midnight', 'start_minute', 'distance_category',
         'distance_x_hour', 'dayOfWeek_sin', 'minutes_since_midnight', 'dropoff_y',
         'start_month', 'hour_sin', 'x2xDistance', 'distance_x_timeOfDay'
     ]
@@ -374,7 +392,54 @@ if __name__ == "__main__":
     print(f"Samples used: {len(X):,}")
     print(f"\nTo make predictions on test data:")
     print(f"  1. Load model: pickle.load(open('{model_path}', 'rb'))")
-    print(f"  2. Engineer test features using same functions")
+    print(f"  2. Engineer test features using same functions with include_duration_features=False")
     print(f"  3. Select only the {len(selected_features)} features listed in {features_path}")
     print(f"  4. Call model.predict(X_test)")
+    
+    # ============== TEST VALIDATION ==============
+    print(f"\n{'='*70}")
+    print("TESTING ON TEST DATA FORMAT")
+    print(f"{'='*70}")
+    
+    # Load test data (if available)
+    test_file = 'TestFileTemplate.csv'
+    try:
+        print(f"\nLoading test file: {test_file}")
+        test_df = pd.read_csv(test_file)
+        print(f"Test samples: {len(test_df):,}")
+        
+        # Engineer features for test data (WITHOUT duration features)
+        print("Engineering test features (without duration)...")
+        test_taxi = engineer_features(test_df, include_duration_features=False)
+        
+        # Select same features used in training
+        X_test = test_taxi[selected_features]
+        
+        print(f"Test features engineered successfully!")
+        print(f"Test X shape: {X_test.shape}")
+        
+        # Make predictions
+        print("\nMaking predictions on test data...")
+        test_predictions = final_model.predict(X_test)
+        
+        print(f"Predictions made successfully!")
+        print(f"Prediction stats:")
+        print(f"  Mean: {test_predictions.mean():.2f}s")
+        print(f"  Median: {np.median(test_predictions):.2f}s")
+        print(f"  Std: {test_predictions.std():.2f}s")
+        print(f"  Min: {test_predictions.min():.2f}s")
+        print(f"  Max: {test_predictions.max():.2f}s")
+        
+        # Save predictions
+        predictions_path = './results_logs/test_predictions.csv'
+        results_df = test_df.copy()
+        results_df['predicted_duration'] = test_predictions
+        results_df.to_csv(predictions_path, index=False)
+        print(f"\nPredictions saved to: {predictions_path}")
+        
+    except FileNotFoundError:
+        print(f"Test file '{test_file}' not found. Skipping test validation.")
+    except Exception as e:
+        print(f"Error during test validation: {e}")
+    
     print(f"\n{'='*70}")
